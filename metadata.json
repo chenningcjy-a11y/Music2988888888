@@ -1,0 +1,6 @@
+{
+  "name": "LUMINA MUSIC",
+  "description": "沉浸式智能音乐播放器，搭载实时 Web Audio 音频可视化、3D 环绕与均衡器 DSP 引擎及智能双语歌词同步。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

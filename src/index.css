@@ -1,0 +1,136 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --font-display: "Outfit", "PingFang SC", "Noto Sans SC", "Microsoft YaHei", sans-serif;
+    --font-sans: "Plus Jakarta Sans", "PingFang SC", "Noto Sans SC", "Microsoft YaHei", sans-serif;
+    --font-mono: "JetBrains Mono", monospace;
+    --lumina-accent: #e8437f;
+    --lumina-secondary: #8b3dff;
+    --lumina-bg-deep: #12040a;
+  }
+
+  html, body, #root {
+    height: 100%;
+    width: 100%;
+    font-family: var(--font-sans);
+    background-color: var(--lumina-bg-deep);
+    color: #faf5f7;
+    overscroll-behavior: none;
+  }
+
+  .font-sans-modern {
+    font-family: "Plus Jakarta Sans", "PingFang SC", "Noto Sans SC", sans-serif;
+  }
+  .font-serif-editorial {
+    font-family: "Fraunces", "Lora", "Songti SC", "SimSun", serif;
+  }
+  .font-sans-rounded {
+    font-family: "DM Sans", "Outfit", "PingFang SC", "Noto Sans SC", sans-serif;
+  }
+  .font-mono-audiophile {
+    font-family: "JetBrains Mono", monospace;
+  }
+  .font-sans-classic {
+    font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+}
+
+/* Custom sleek scrollbars for glass panels */
+.lumina-scroll::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+.lumina-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.lumina-scroll::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.14);
+  border-radius: 9999px;
+}
+
+.lumina-scroll::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.28);
+}
+
+/* Custom range slider styling for audio controls, MV timeline scrubbing, and EQ */
+input[type="range"].lumina-range {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+  height: 28px;
+  touch-action: none;
+  margin: 0;
+  padding: 0;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+input[type="range"].lumina-range::-webkit-slider-runnable-track {
+  height: 6px;
+  border-radius: 9999px;
+  background: rgba(255, 255, 255, 0.16);
+}
+
+input[type="range"].lumina-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 9999px;
+  background: #ffffff;
+  box-shadow: 0 0 12px rgba(232, 67, 127, 0.85);
+  margin-top: -6px;
+  transition: transform 0.12s ease;
+}
+
+input[type="range"].lumina-range:hover::-webkit-slider-thumb,
+input[type="range"].lumina-range:active::-webkit-slider-thumb {
+  transform: scale(1.22);
+}
+
+input[type="range"].lumina-range::-moz-range-track {
+  height: 6px;
+  border-radius: 9999px;
+  background: rgba(255, 255, 255, 0.16);
+}
+
+input[type="range"].lumina-range::-moz-range-thumb {
+  width: 18px;
+  height: 18px;
+  border: none;
+  border-radius: 9999px;
+  background: #ffffff;
+  box-shadow: 0 0 12px rgba(232, 67, 127, 0.85);
+  transition: transform 0.12s ease;
+}
+
+input[type="range"].lumina-range-vertical {
+  writing-mode: vertical-lr;
+  direction: rtl;
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+}
+
+@keyframes luminaLyricSlide {
+  from {
+    opacity: 0.72;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
