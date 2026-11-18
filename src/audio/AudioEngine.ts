@@ -72,6 +72,13 @@ export class LuminaAudioEngine {
   private currentVolume = 0.85;
   private currentMuted = false;
   private currentObjectUrl: string | null = null;
+  private primingAudio = false;
+  private playOpSeq = 0;
+  private pendingPlayPromise: Promise<void> | null = null;
+
+  public get isPriming(): boolean {
+    return this.primingAudio;
+  }
 
   constructor() {
     this.audioEl = new Audio();
@@ -483,6 +490,8 @@ export class LuminaAudioEngine {
   }
 
   public loadBlob(blob: Blob): string {
+    this.playOpSeq++;
+    this.audioEl.pause();
     this.clearStems();
     if (this.currentObjectUrl) {
       URL.revokeObjectURL(this.currentObjectUrl);
@@ -496,8 +505,30 @@ export class LuminaAudioEngine {
   }
 
   public async play(): Promise<void> {
+    const op = ++this.playOpSeq;
     await this.resumeContext();
-    await this.audioEl.play();
+    if (op !== this.playOpSeq || !this.audioEl.src) return;
+
+    const promise = this.audioEl.play();
+    this.pendingPlayPromise = promise;
+    try {
+      await promise;
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        return;
+      }
+      throw err;
+    } finally {
+      if (this.pendingPlayPromise === promise) {
+        this.pendingPlayPromise = null;
+      }
+    }
+
+    if (op !== this.playOpSeq) {
+      this.audioEl.pause();
+      return;
+    }
+
     if (
       this.currentSettings.stemModeActive &&
       this.vocalBuffer &&
@@ -508,8 +539,20 @@ export class LuminaAudioEngine {
   }
 
   public pause(): void {
-    this.audioEl.pause();
+    const op = ++this.playOpSeq;
     this.stopStemSources();
+    const pending = this.pendingPlayPromise;
+    if (pending) {
+      pending
+        .catch(() => {})
+        .finally(() => {
+          if (op === this.playOpSeq) {
+            this.audioEl.pause();
+          }
+        });
+      return;
+    }
+    this.audioEl.pause();
   }
 
   public seek(timeSec: number): void {
@@ -567,12 +610,51 @@ export class LuminaAudioEngine {
   }
 
   /**
+   * Unlocks & pre-buffers HTMLAudioElement inside a user gesture while songMixGain is muted (0),
+   * so delayed intro->song handoff starts instantaneously with zero autoplay block or decode hiccup.
+   */
+  public async primeForDelayedPlayback(): Promise<void> {
+    const op = ++this.playOpSeq;
+    const ctx = this.ensureInitialized();
+    if (ctx.state === 'suspended') {
+      await ctx.resume().catch(() => {});
+    }
+    if (op !== this.playOpSeq) return;
+    if (this.songMixGain) {
+      this.songMixGain.gain.cancelScheduledValues(ctx.currentTime);
+      this.songMixGain.gain.setValueAtTime(0, ctx.currentTime);
+    }
+    if (!this.audioEl.src) return;
+    this.primingAudio = true;
+    try {
+      this.audioEl.currentTime = 0;
+      const promise = this.audioEl.play();
+      this.pendingPlayPromise = promise;
+      try {
+        await promise;
+      } finally {
+        if (this.pendingPlayPromise === promise) {
+          this.pendingPlayPromise = null;
+        }
+      }
+      if (op === this.playOpSeq) {
+        this.audioEl.pause();
+        this.audioEl.currentTime = 0;
+      }
+    } catch {
+      // Ignore AbortError or metadata not yet buffered
+    } finally {
+      this.primingAudio = false;
+    }
+  }
+
+  /**
    * Smoothly crossfades song audio vs MV audio via Web Audio GainNodes without pops or abrupt gaps.
    */
-  public setTheaterMixGains(songGain: number, mvGain: number, timeConstantSec = 0.03): void {
+  public setTheaterMixGains(songGain: number, mvGain: number, timeConstantSec = 0.018): void {
     if (!this.ctx) return;
     const now = this.ctx.currentTime;
-    const tc = Math.max(0.008, timeConstantSec);
+    const tc = Math.max(0.005, timeConstantSec);
     const s = Math.max(0, Math.min(1, Number.isFinite(songGain) ? songGain : 1));
     const m = Math.max(0, Math.min(1, Number.isFinite(mvGain) ? mvGain : 0));
     this.songMixGain?.gain.setTargetAtTime(s, now, tc);

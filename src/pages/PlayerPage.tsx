@@ -338,16 +338,12 @@ export const PlayerPage: React.FC = () => {
         >
           {/* LEFT HALF: Upper Stationary Square Cover + Title & Artist, Lower Progress Bar & Transport Buttons */}
           <section className="relative h-full min-h-0 flex flex-col items-center justify-between px-6 sm:px-10 lg:px-14 py-4 sm:py-7 lg:py-10">
-            {/* Upper area: Square stationary album cover with soft audio-reactive fluid aura */}
+            {/* Upper area: Plain stationary album cover */}
             <div className="flex-1 min-h-0 w-full flex flex-col items-center justify-center">
               <FullscreenCoverFluidStage
                 coverUrl={currentTrack?.coverDataUrl}
                 title={currentTrack?.title || 'LUMINA MUSIC'}
                 trackId={currentTrack?.id}
-                isPlaying={isPlaying}
-                palette={activePalette}
-                animationIntensity={personalization.animationIntensity}
-                reducedMotion={Boolean(personalization.reducedMotion)}
               />
 
               {/* Song Name & Artist right below Square Album Cover */}

@@ -111,11 +111,12 @@ export function findTriggeredMidBreak(
   return null;
 }
 
-export const MV_AUDIO_OVERLAP_SEC = 0.5;
+export const MV_AUDIO_OVERLAP_SEC = 0.55;
+export const MV_PRE_CROSSFADE_SEC = 0.45;
 
 /**
  * Computes UI opacity (0..1), skip affordance, and equal-power audio crossfade gains
- * (`songAudioGain`, `mvAudioGain`) so boundaries transition seamlessly without gaps or abrupt cuts.
+ * (`songAudioGain`, `mvAudioGain`) so boundaries transition seamlessly without gaps, volume dips, or abrupt cuts.
  */
 export function computeTheaterVisualState(params: {
   phase: MvTheaterPhase;
@@ -129,6 +130,7 @@ export function computeTheaterVisualState(params: {
   fadeInSec?: number;
   fadeOutSec?: number;
   outroStartMvSec?: number;
+  allowIntroTailCrossfade?: boolean;
 }): {
   uiOpacity: number;
   isTheaterClarity: boolean;
@@ -149,6 +151,7 @@ export function computeTheaterVisualState(params: {
     fadeInSec = MV_FADE_LEAD_SEC,
     fadeOutSec = MV_FADE_LEAD_SEC,
     outroStartMvSec = 0,
+    allowIntroTailCrossfade = true,
   } = params;
 
   const safeFadeIn = Math.max(0, Math.min(10, Number.isFinite(fadeInSec) ? fadeInSec : MV_FADE_LEAD_SEC));
@@ -157,13 +160,9 @@ export function computeTheaterVisualState(params: {
   if (phase === 'intro') {
     const endSec = timeline.introEndSec || 0;
     const remaining = Math.max(0, endSec - mvPhaseTime);
-    const fadeWindow = Math.min(MV_AUDIO_OVERLAP_SEC, Math.max(0.2, endSec * 0.4));
-    let mvAudioGain = 1;
-    if (endSec > 0.4 && remaining <= fadeWindow) {
-      const p = Math.max(0, Math.min(1, 1 - remaining / fadeWindow));
-      // Smoothly taper from 1.0 -> 0.707 at boundary, then 0.707 -> 0 over first 0.5s of song
-      mvAudioGain = Math.cos(p * Math.PI * 0.25);
-    }
+    // Keep MV audio at full unity (1.0) right up to introEndSec so there is no dip
+    // before the equal-power overlap crossfade begins at song t=0.
+    const mvAudioGain = 1;
 
     if (safeFadeIn > 0.05 && remaining <= safeFadeIn && endSec > 0.3) {
       const progress = Math.max(0, Math.min(1, 1 - remaining / safeFadeIn));
@@ -187,20 +186,10 @@ export function computeTheaterVisualState(params: {
   }
 
   if (phase === 'mid-break' && activeMidBreak) {
-    const elapsed = Math.max(0, mvPhaseTime - activeMidBreak.mvStartSec);
     const remaining = Math.max(0, activeMidBreak.mvEndSec - mvPhaseTime);
-    const segDur = Math.max(0.4, activeMidBreak.mvEndSec - activeMidBreak.mvStartSec);
-    const inWin = Math.min(0.45, segDur * 0.35);
-    const outWin = Math.min(MV_AUDIO_OVERLAP_SEC, segDur * 0.35);
-
-    let mvAudioGain = 1;
-    if (elapsed < inWin) {
-      const pIn = Math.max(0, Math.min(1, elapsed / inWin));
-      mvAudioGain = Math.sin((0.35 + 0.65 * pIn) * Math.PI * 0.5);
-    } else if (remaining <= outWin) {
-      const pOut = Math.max(0, Math.min(1, 1 - remaining / outWin));
-      mvAudioGain = Math.cos(pOut * Math.PI * 0.25);
-    }
+    // Pre-crossfade before entering mid-break already brought mvAudioGain smoothly to 1.0,
+    // so hold mvAudioGain at 1.0 cleanly until the song resumes at mvEndSec.
+    const mvAudioGain = 1;
 
     if (safeFadeIn > 0.05 && remaining <= safeFadeIn) {
       const progress = Math.max(0, Math.min(1, 1 - remaining / safeFadeIn));
@@ -225,8 +214,9 @@ export function computeTheaterVisualState(params: {
 
   if (phase === 'outro') {
     const elapsed = Math.max(0, mvPhaseTime - outroStartMvSec);
-    const pIn = Math.max(0, Math.min(1, elapsed / 0.45));
-    const mvAudioGain = Math.sin((0.35 + 0.65 * pIn) * Math.PI * 0.5);
+    // If outro started abruptly (e.g. seeked straight into outro), ramp gently;
+    // otherwise pre-crossfade at song end already brought mvAudioGain to 1.0.
+    const mvAudioGain = elapsed < 0.05 ? 1 : 1;
     return {
       uiOpacity: 0,
       isTheaterClarity: true,
@@ -237,45 +227,56 @@ export function computeTheaterVisualState(params: {
     };
   }
 
-  // Normal phase: compute smooth audio crossfades & anticipatory UI fade-out
+  // Normal phase: compute equal-power (sin^2 + cos^2 = 1) crossfades & anticipatory UI fade-out
   let songAudioGain = 1;
   let mvAudioGain = 0;
 
   const sortedBreaks = normalizeMidBreaks(timeline.midBreaks || []);
 
-  // Crossfade tail right after Intro -> Music boundary
-  if (timeline.introEnabled && (timeline.introEndSec || 0) > 0.3 && audioTime < MV_AUDIO_OVERLAP_SEC) {
+  // 1. Equal-power crossfade tail right after Intro -> Music boundary [0 .. MV_AUDIO_OVERLAP_SEC]
+  if (
+    allowIntroTailCrossfade &&
+    timeline.introEnabled &&
+    (timeline.introEndSec || 0) > 0.3 &&
+    audioTime >= 0 &&
+    audioTime < MV_AUDIO_OVERLAP_SEC
+  ) {
     const t = Math.max(0, Math.min(1, audioTime / MV_AUDIO_OVERLAP_SEC));
     songAudioGain = Math.sin(t * Math.PI * 0.5);
-    mvAudioGain = Math.cos((0.5 + 0.5 * t) * Math.PI * 0.5);
+    mvAudioGain = Math.cos(t * Math.PI * 0.5);
   }
 
-  // Crossfade tail right after a Mid-Break -> Music boundary
+  // 2. Equal-power crossfade tail right after a Mid-Break -> Music boundary
   for (const brk of sortedBreaks) {
     if (
       completedBreakIds?.has(brk.id) &&
       audioTime >= brk.audioTriggerSec &&
       audioTime < brk.audioTriggerSec + MV_AUDIO_OVERLAP_SEC
     ) {
-      const t = Math.max(0, Math.min(1, (audioTime - brk.audioTriggerSec) / MV_AUDIO_OVERLAP_SEC));
+      const t = Math.max(
+        0,
+        Math.min(1, (audioTime - brk.audioTriggerSec) / MV_AUDIO_OVERLAP_SEC)
+      );
       songAudioGain = Math.min(songAudioGain, Math.sin(t * Math.PI * 0.5));
-      mvAudioGain = Math.max(mvAudioGain, Math.cos((0.5 + 0.5 * t) * Math.PI * 0.5));
+      mvAudioGain = Math.max(mvAudioGain, Math.cos(t * Math.PI * 0.5));
     }
   }
 
-  // Smooth pre-taper of song right before an upcoming Mid-Break
+  // 3. Equal-power pre-crossfade right before an upcoming Mid-Break
   for (const brk of sortedBreaks) {
     if (completedBreakIds?.has(brk.id)) continue;
     const dist = brk.audioTriggerSec - audioTime;
-    if (dist >= 0 && dist <= 0.45) {
-      songAudioGain = Math.min(songAudioGain, 0.45 + 0.55 * (dist / 0.45));
+    if (dist >= 0 && dist <= MV_PRE_CROSSFADE_SEC) {
+      const p = Math.max(0, Math.min(1, 1 - dist / MV_PRE_CROSSFADE_SEC));
+      songAudioGain = Math.min(songAudioGain, Math.cos(p * Math.PI * 0.5));
+      mvAudioGain = Math.max(mvAudioGain, Math.sin(p * Math.PI * 0.5));
     }
   }
 
-  // Smooth pre-taper of song right before Outro
+  // 4. Equal-power pre-crossfade right before Outro
   if (timeline.outroEnabled && audioDuration > 0) {
     const distToEnd = audioDuration - audioTime;
-    if (distToEnd >= 0 && distToEnd <= 0.45) {
+    if (distToEnd >= 0 && distToEnd <= MV_PRE_CROSSFADE_SEC) {
       const endSyncMv = computeSyncedMvTime(
         audioDuration,
         timeline,
@@ -283,7 +284,9 @@ export function computeTheaterVisualState(params: {
       );
       const outroEnd = timeline.outroEndSec || mvDurationSec || 0;
       if (outroEnd > endSyncMv + 0.5) {
-        songAudioGain = Math.min(songAudioGain, 0.45 + 0.55 * (distToEnd / 0.45));
+        const p = Math.max(0, Math.min(1, 1 - distToEnd / MV_PRE_CROSSFADE_SEC));
+        songAudioGain = Math.min(songAudioGain, Math.cos(p * Math.PI * 0.5));
+        mvAudioGain = Math.max(mvAudioGain, Math.sin(p * Math.PI * 0.5));
       }
     }
   }

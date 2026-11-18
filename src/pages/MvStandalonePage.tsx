@@ -348,7 +348,12 @@ export const MvStandalonePage: React.FC = () => {
     1,
     snapshot?.mvDurationSec || videoDurationFallback || snapshot?.audioDuration || 1
   );
-  const currentMvTime = scrubMvTime ?? (snapshot?.mvTargetTime || 0);
+  const ipcLatencySec =
+    snapshot?.isPlaying && snapshot?.sentAt
+      ? Math.max(0, Math.min(0.15, (Date.now() - snapshot.sentAt) / 1000))
+      : 0;
+  const currentMvTime =
+    scrubMvTime ?? ((snapshot?.mvTargetTime || 0) + ipcLatencySec);
   const progressPct = Math.min(
     100,
     Math.max(0, (currentMvTime / totalMvDuration) * 100)
