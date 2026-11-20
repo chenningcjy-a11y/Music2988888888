@@ -25,9 +25,12 @@ import {
   getTrackStems,
   hasInitializedDemo,
   loadAudioSettings,
+  loadPendingMvTimelines,
   loadPersonalization,
   loadPlaybackPrefs,
   markDemoInitialized,
+  matchAndConsumePendingMvTimeline,
+  removePendingMvTimelineById,
   saveAudioSettings,
   savePersonalization,
   savePlaybackPrefs,
@@ -43,6 +46,7 @@ import {
   MvMidBreakRange,
   MvTheaterPhase,
   NavPage,
+  PendingMvTimelineRecord,
   PersonalizationSettings,
   Playlist,
   RepeatMode,
@@ -199,6 +203,7 @@ interface MusicContextValue {
   // MV Library & Theater Timeline Sync
   trackMvs: TrackMvMeta[];
   allMvCountByTrack: Record<string, number>;
+  pendingMvTimelines: PendingMvTimelineRecord[];
   activeMv: TrackMvRecord | null;
   activeMvVideoUrl: string | null;
   mvPhase: MvTheaterPhase;
@@ -217,6 +222,8 @@ interface MusicContextValue {
   selectActiveTrackMv: (trackId: string, mvId: string) => Promise<void>;
   updateTrackMvConfig: (mvId: string, patch: Partial<TrackMvMeta>) => Promise<void>;
   deleteTrackMv: (mvId: string) => Promise<void>;
+  refreshPendingMvTimelines: () => Promise<void>;
+  removePendingMvTimeline: (id: string) => Promise<void>;
   skipMvPhase: () => Promise<void>;
   restartTrackWithMvIntro: () => Promise<void>;
   seekMvTimeline: (mvTimeSec: number) => void;
@@ -264,6 +271,7 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
   // MV state
   const [trackMvs, setTrackMvs] = useState<TrackMvMeta[]>([]);
   const [allMvCountByTrack, setAllMvCountByTrack] = useState<Record<string, number>>({});
+  const [pendingMvTimelines, setPendingMvTimelines] = useState<PendingMvTimelineRecord[]>([]);
   const [activeMv, setActiveMv] = useState<TrackMvRecord | null>(null);
   const [activeMvVideoUrl, setActiveMvVideoUrl] = useState<string | null>(null);
   const [mvPhase, setMvPhase] = useState<MvTheaterPhase>('normal');
@@ -432,7 +440,7 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
       audioEngine.pause();
       const blob = await getAudioBlob(track.id);
       if (loadSeqRef.current !== seq) return;
-      if (!blob) {
+      if (!blob || blob.size === 0) {
         showToast('未找到音频文件数据，请重新导入该歌曲');
         return;
       }
@@ -695,11 +703,13 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
       }
 
       if (cancelled) return;
-      const [existingPlaylists, existingStemMetas, existingMvMetas] = await Promise.all([
-        getAllPlaylists(),
-        getAllStemMetas(),
-        getAllMvMetas(),
-      ]);
+      const [existingPlaylists, existingStemMetas, existingMvMetas, existingPendingMvs] =
+        await Promise.all([
+          getAllPlaylists(),
+          getAllStemMetas(),
+          getAllMvMetas(),
+          loadPendingMvTimelines(),
+        ]);
       if (cancelled) return;
 
       const metaMap: Record<string, TrackStemsMeta> = {};
@@ -716,6 +726,7 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
       setPlaylists(existingPlaylists);
       setStemMetas(metaMap);
       setAllMvCountByTrack(mvCountMap);
+      setPendingMvTimelines(existingPendingMvs);
       setQueueIds(existingTracks.map((t) => t.id));
 
       const preferred =
@@ -1354,7 +1365,8 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
             savePersonalization(next).catch(() => {});
             return next;
           });
-          showToast(`已完成 ${res.translatedCount} 行诗意双语翻译`);
+          const via = res.providerName ? ` (${res.providerName})` : '';
+          showToast(`已完成 ${res.translatedCount} 行诗意双语翻译${via}`);
         } else if (res.skippedReason === 'already_bilingual') {
           showToast('当前歌词已包含双语译文');
         } else {
@@ -1602,6 +1614,7 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
       allPlaylists,
       allMetas,
       allMvMetas,
+      pendingMvs,
     ] = await Promise.all([
       loadAudioSettings(),
       loadPersonalization(),
@@ -1610,6 +1623,7 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
       getAllPlaylists(),
       getAllStemMetas(),
       getAllMvMetas(),
+      loadPendingMvTimelines(),
     ]);
 
     setAudioSettings(loadedAudio);
@@ -1635,6 +1649,7 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
     setPlaylists(allPlaylists);
     setStemMetas(metaMap);
     setAllMvCountByTrack(mvCountMap);
+    setPendingMvTimelines(pendingMvs);
     setQueueIds(allTracks.map((t) => t.id));
 
     const preferred =
@@ -1728,6 +1743,20 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
     }
   }, [isFullscreen, exitFullscreen, showToast]);
 
+  const refreshPendingMvTimelines = useCallback(async () => {
+    const list = await loadPendingMvTimelines();
+    setPendingMvTimelines(list);
+  }, []);
+
+  const removePendingMvTimeline = useCallback(
+    async (id: string) => {
+      await removePendingMvTimelineById(id);
+      await refreshPendingMvTimelines();
+      showToast('已移除待匹配的 MV 时间轴预设');
+    },
+    [refreshPendingMvTimelines, showToast]
+  );
+
   // MV CRUD & Skip Controls
   const uploadTrackMvFile = useCallback(
     async (trackId: string, file: File): Promise<TrackMvMeta> => {
@@ -1743,10 +1772,22 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
         ? crypto.randomUUID()
         : `mv-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 
+      const targetTrack = stateRef.current.tracks.find((t) => t.id === trackId);
+      const baseTitle = file.name.replace(/\.[^/.]+$/, '') || '本地 MV 视频';
+      const matchedPending = await matchAndConsumePendingMvTimeline({
+        trackId,
+        trackTitle: targetTrack?.title,
+        trackArtist: targetTrack?.artist,
+        fileName: file.name,
+        mvTitle: baseTitle,
+        fileSizeBytes: file.size,
+        durationSec,
+      });
+
       const record: TrackMvRecord = {
         id: mvId,
         trackId,
-        title: file.name.replace(/\.[^/.]+$/, '') || '本地 MV 视频',
+        title: matchedPending?.mvTitle || baseTitle,
         fileName: file.name,
         mimeType: file.type || 'video/mp4',
         fileSizeBytes: file.size,
@@ -1754,9 +1795,9 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
         sourceType: 'local',
         addedAt: Date.now(),
         isActive: true,
-        blurPx: 14,
-        opacityPct: 48,
-        timeline: createDefaultMvTimeline(),
+        blurPx: matchedPending?.blurPx ?? 14,
+        opacityPct: matchedPending?.opacityPct ?? 48,
+        timeline: matchedPending?.timeline || createDefaultMvTimeline(),
         videoBlob: file,
       };
 
@@ -1768,14 +1809,39 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
       }
       await saveTrackMv(record);
       await refreshAllMvCounts();
+      if (matchedPending) {
+        await refreshPendingMvTimelines();
+      }
       if (currentTrackId === trackId) {
         await syncTrackMvsForTrack(trackId);
       }
-      showToast(`已导入 MV「${record.title}」并设为当前曲目默认版本`);
+      if (matchedPending) {
+        const introDesc = matchedPending.timeline.introEnabled
+          ? `前瞻 ${matchedPending.timeline.introEndSec}s`
+          : '前瞻关闭';
+        const outroDesc = matchedPending.timeline.outroEnabled
+          ? `后段 ${
+              matchedPending.timeline.outroEndSec
+                ? `${matchedPending.timeline.outroEndSec}s`
+                : '至末尾'
+            }`
+          : '后段关闭';
+        showToast(
+          `已导入 MV「${record.title}」并自动匹配恢复（${introDesc} · ${outroDesc}）`
+        );
+      } else {
+        showToast(`已导入 MV「${record.title}」并设为当前曲目默认版本`);
+      }
       const { videoBlob: _b, ...meta } = record;
       return meta;
     },
-    [currentTrackId, refreshAllMvCounts, showToast, syncTrackMvsForTrack]
+    [
+      currentTrackId,
+      refreshAllMvCounts,
+      refreshPendingMvTimelines,
+      showToast,
+      syncTrackMvsForTrack,
+    ]
   );
 
   const bindTrackMvUrl = useCallback(
@@ -1789,10 +1855,21 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
         ? crypto.randomUUID()
         : `mv-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 
+      const targetTrack = stateRef.current.tracks.find((t) => t.id === trackId);
+      const baseTitle = title?.trim() || '在线 MV 链接';
+      const matchedPending = await matchAndConsumePendingMvTimeline({
+        trackId,
+        trackTitle: targetTrack?.title,
+        trackArtist: targetTrack?.artist,
+        fileName: trimmed,
+        mvTitle: baseTitle,
+        durationSec,
+      });
+
       const record: TrackMvRecord = {
         id: mvId,
         trackId,
-        title: title?.trim() || '在线 MV 链接',
+        title: matchedPending?.mvTitle || baseTitle,
         fileName: trimmed,
         mimeType: 'video/mp4',
         fileSizeBytes: 0,
@@ -1801,9 +1878,9 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
         externalUrl: trimmed,
         addedAt: Date.now(),
         isActive: true,
-        blurPx: 14,
-        opacityPct: 48,
-        timeline: createDefaultMvTimeline(),
+        blurPx: matchedPending?.blurPx ?? 14,
+        opacityPct: matchedPending?.opacityPct ?? 48,
+        timeline: matchedPending?.timeline || createDefaultMvTimeline(),
       };
 
       const existing = await getTrackMvs(trackId);
@@ -1814,14 +1891,35 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
       }
       await saveTrackMv(record);
       await refreshAllMvCounts();
+      if (matchedPending) {
+        await refreshPendingMvTimelines();
+        const introDesc = matchedPending.timeline.introEnabled
+          ? `前瞻 ${matchedPending.timeline.introEndSec}s`
+          : '前瞻关闭';
+        const outroDesc = matchedPending.timeline.outroEnabled
+          ? `后段 ${
+              matchedPending.timeline.outroEndSec
+                ? `${matchedPending.timeline.outroEndSec}s`
+                : '至末尾'
+            }`
+          : '后段关闭';
+        showToast(`已绑定 MV 链接并自动匹配恢复（${introDesc} · ${outroDesc}）`);
+      } else {
+        showToast(`已绑定 MV 链接「${record.title}」`);
+      }
       if (currentTrackId === trackId) {
         await syncTrackMvsForTrack(trackId);
       }
-      showToast(`已绑定 MV 链接「${record.title}」`);
       const { videoBlob: _b, ...meta } = record;
       return meta;
     },
-    [currentTrackId, refreshAllMvCounts, showToast, syncTrackMvsForTrack]
+    [
+      currentTrackId,
+      refreshAllMvCounts,
+      refreshPendingMvTimelines,
+      showToast,
+      syncTrackMvsForTrack,
+    ]
   );
 
   const selectActiveTrackMv = useCallback(
@@ -2394,6 +2492,7 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
     reloadAllLibraryData,
     trackMvs,
     allMvCountByTrack,
+    pendingMvTimelines,
     activeMv,
     activeMvVideoUrl,
     mvPhase,
@@ -2412,6 +2511,8 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
     selectActiveTrackMv,
     updateTrackMvConfig,
     deleteTrackMv,
+    refreshPendingMvTimelines,
+    removePendingMvTimeline,
     skipMvPhase,
     restartTrackWithMvIntro,
     seekMvTimeline,

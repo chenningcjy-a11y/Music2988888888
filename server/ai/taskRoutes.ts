@@ -1021,6 +1021,15 @@ Return strictly valid JSON matching:
             typeof providerId === 'string' && providerId ? providerId : undefined
           );
 
+      if (providerId && !forceBuiltin) {
+        if (!resolved || !resolved.provider.enabled || !resolved.apiKey) {
+          res.status(400).json({
+            error: `所选 AI 服务商（${resolved?.provider.name || providerId}）未启用或尚未填写 API Key，请前往「AI 智能中心 → API 服务管理」配置后再试。`,
+          });
+          return;
+        }
+      }
+
       let providerName = '';
       let modelUsed = '';
       let usedVisualFrames = false;

@@ -296,6 +296,8 @@ export async function translateLyricsToBilingual(
   bilingualLyrics: string;
   translatedCount: number;
   skippedReason?: string;
+  providerName?: string;
+  modelUsed?: string;
 }> {
   const res = await fetch('/api/lyrics/translate', {
     method: 'POST',
@@ -320,5 +322,7 @@ export async function translateLyricsToBilingual(
     bilingualLyrics: string;
     translatedCount: number;
     skippedReason?: string;
+    providerName?: string;
+    modelUsed?: string;
   };
 }

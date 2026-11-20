@@ -230,3 +230,32 @@ export interface AudioAnalysisFrame {
   frequencies: Uint8Array;
   waveform: Uint8Array;
 }
+
+export interface PendingMvTimelineRecord {
+  id: string;
+  trackId?: string;
+  trackTitle?: string;
+  trackArtist?: string;
+  mvTitle: string;
+  fileName: string;
+  mimeType?: string;
+  fileSizeBytes?: number;
+  durationSec?: number;
+  blurPx: number;
+  opacityPct: number;
+  timeline: TrackMvTimelineConfig;
+  savedAt: number;
+}
+
+export interface BackupSelectionOptions {
+  includeTracksMeta: boolean;
+  includeTrackAudio: boolean;
+  includePlaylists: boolean;
+  includeMvTimelines: boolean;
+  includeMvVideos: boolean;
+  includeStems: boolean;
+  includeAudioSettings: boolean;
+  includePersonalization: boolean;
+  includeAiData: boolean;
+}
+

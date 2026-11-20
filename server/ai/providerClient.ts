@@ -540,8 +540,8 @@ export async function callProviderTextCompletion(params: {
       const errMsg =
         (parsed?.error as { message?: string })?.message ||
         (parsed?.message as string) ||
-        `API 返回错误 (${res.status}): ${rawText.slice(0, 180)}`;
-      throw new Error(errMsg);
+        `HTTP ${res.status}: ${rawText.slice(0, 180)}`;
+      throw new Error(`[${provider.name} · ${model}] ${errMsg}`);
     }
 
     const choices = parsed?.choices as
@@ -560,10 +560,28 @@ export async function callProviderTextCompletion(params: {
 }
 
 export function extractJsonFromLlmText<T>(raw: string): T {
-  const trimmed = raw.trim();
-  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const candidate = fenced ? fenced[1].trim() : trimmed;
-  return JSON.parse(candidate) as T;
+  const withoutThink = raw.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+  const fenced = withoutThink.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = (fenced ? fenced[1] : withoutThink).trim();
+  try {
+    return JSON.parse(candidate) as T;
+  } catch {
+    const objStart = candidate.indexOf('{');
+    const objEnd = candidate.lastIndexOf('}');
+    const arrStart = candidate.indexOf('[');
+    const arrEnd = candidate.lastIndexOf(']');
+    if (
+      arrStart !== -1 &&
+      arrEnd > arrStart &&
+      (objStart === -1 || arrStart < objStart)
+    ) {
+      return JSON.parse(candidate.slice(arrStart, arrEnd + 1)) as T;
+    }
+    if (objStart !== -1 && objEnd > objStart) {
+      return JSON.parse(candidate.slice(objStart, objEnd + 1)) as T;
+    }
+    throw new Error('AI 返回的内容不是有效的 JSON 格式');
+  }
 }
 
 export { Type };

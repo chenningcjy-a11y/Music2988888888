@@ -573,19 +573,56 @@ async function startServer() {
       const langInstruction = TARGET_LANGUAGE_PROMPTS[targetLanguage];
       const styleInstruction = STYLE_INSTRUCTIONS[style];
       let translations: { idx: number; translation: string }[] = [];
+      let actualProviderName = '内置 Gemini';
+      let actualModelUsed = 'gemini-4-hydrogen';
 
-      if (providerId) {
-        try {
-          const resolved = await getStoredProviderWithKey(providerId);
-          if (resolved && resolved.apiKey) {
-            const userPrompt = JSON.stringify({
-              song: trackTitle,
-              artist: artistName,
-              targetLanguage,
-              style,
-              lines: translatable,
-            });
-            const systemInstruction = `You are an acclaimed literary song lyricist and poetic translator.
+      const forceBuiltin = providerId === '__builtin_gemini__';
+      const resolved = forceBuiltin
+        ? null
+        : await getStoredProviderWithKey(providerId || undefined);
+
+      // If caller explicitly chose a non-builtin provider (e.g. DeepSeek), NEVER silently replace it with built-in Gemini
+      if (providerId && !forceBuiltin) {
+        if (!resolved) {
+          res.status(400).json({
+            error: `未找到所选 AI 服务商 (${providerId})，请在「AI 智能中心 → API 服务管理」检查配置。`,
+          });
+          return;
+        }
+        if (!resolved.provider.enabled) {
+          res.status(400).json({
+            error: `所选 AI 服务商「${resolved.provider.name}」已被禁用，请先在「API 服务管理」中启用。`,
+          });
+          return;
+        }
+        if (!resolved.apiKey) {
+          res.status(400).json({
+            error: `所选 AI 服务商「${resolved.provider.name}」尚未配置 API Key，请前往「API 服务管理」填写您的密钥后再试。`,
+          });
+          return;
+        }
+      }
+
+      const shouldUseUserProvider = Boolean(
+        !forceBuiltin &&
+          resolved &&
+          resolved.provider.enabled &&
+          resolved.apiKey
+      );
+
+      if (shouldUseUserProvider && resolved) {
+        const effectiveModel = (modelName || resolved.provider.model || '').trim();
+        actualProviderName = resolved.provider.name;
+        actualModelUsed = effectiveModel;
+
+        const userPrompt = JSON.stringify({
+          song: trackTitle,
+          artist: artistName,
+          targetLanguage,
+          style,
+          lines: translatable,
+        });
+        const systemInstruction = `You are an acclaimed literary song lyricist and poetic translator.
 Translate the given song lyrics line by line into ${langInstruction}.
 Translation style requirement: ${styleInstruction}
 Guidelines:
@@ -594,31 +631,51 @@ Guidelines:
 3. Keep recurring chorus lines consistent in phrasing and tone across the whole song.
 4. If a line is already in the target language, purely vocalizations ("Ooh", "Ah", "La la la", "Yeah"), or instrumental/credit metadata ("Instrumental", "作曲", "作词"), return an empty string "" for translation.
 5. Preserve the exact idx for every item in the input array; never merge or skip indices.
-6. Return purely valid JSON array in the format: [{"idx": 0, "translation": "..."}]`;
+6. Return strictly a valid JSON object matching this exact schema (not a markdown block or bare array):
+{"translations": [{"idx": 0, "translation": "..."}]}`;
 
-            const responseText = await callProviderTextCompletion({
-              provider: resolved.provider,
-              apiKey: resolved.apiKey,
-              modelOverride: modelName || resolved.provider.model,
-              systemInstruction,
-              userPrompt,
-              expectJson: true,
-            });
+        const responseText = await callProviderTextCompletion({
+          provider: resolved.provider,
+          apiKey: resolved.apiKey,
+          modelOverride: effectiveModel,
+          systemInstruction,
+          userPrompt,
+          expectJson: true,
+        });
 
-            const parsedJson = extractJsonFromLlmText<unknown>(responseText);
-            if (Array.isArray(parsedJson)) {
-              translations = parsedJson as { idx: number; translation: string }[];
-            }
+        const parsedJson = extractJsonFromLlmText<unknown>(responseText);
+        if (Array.isArray(parsedJson)) {
+          translations = parsedJson as { idx: number; translation: string }[];
+        } else if (parsedJson && typeof parsedJson === 'object') {
+          const obj = parsedJson as Record<string, unknown>;
+          const candidateArr =
+            obj.translations ??
+            obj.items ??
+            obj.lines ??
+            obj.results ??
+            obj.data ??
+            Object.values(obj).find((v) => Array.isArray(v));
+          if (Array.isArray(candidateArr)) {
+            translations = candidateArr as { idx: number; translation: string }[];
           }
-        } catch (providerErr) {
-          console.warn('Selected provider translation failed, falling back to Gemini:', providerErr);
         }
-      }
 
-      if (!translations || translations.length === 0) {
+        if (!Array.isArray(translations) || translations.length === 0) {
+          throw new Error(
+            `${resolved.provider.name} (${effectiveModel}) 返回的翻译 JSON 格式缺少 translations 数组，请重试`
+          );
+        }
+      } else {
         const ai = getGeminiClient();
+        const geminiModel =
+          modelName && modelName.startsWith('gemini-')
+            ? modelName
+            : 'gemini-4-hydrogen';
+        actualProviderName = '内置 Gemini';
+        actualModelUsed = geminiModel;
+
         const response = await ai.models.generateContent({
-          model: 'gemini-4-hydrogen',
+          model: geminiModel,
           contents: JSON.stringify({
             song: trackTitle,
             artist: artistName,
@@ -690,6 +747,8 @@ Guidelines for poetic beauty:
       res.json({
         bilingualLyrics: outputLines.join('\n'),
         translatedCount,
+        providerName: actualProviderName,
+        modelUsed: actualModelUsed,
       });
     } catch (err) {
       console.error('Lyrics translate error:', err);

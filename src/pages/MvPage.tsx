@@ -43,6 +43,7 @@ export const MvPage: React.FC = () => {
     updatePersonalization,
     trackMvs,
     allMvCountByTrack,
+    pendingMvTimelines,
     activeMv,
     activeMvVideoUrl,
     mvPhase,
@@ -108,6 +109,14 @@ export const MvPage: React.FC = () => {
       return;
     }
     const file = files[0];
+    const isLikelyVideo =
+      file.type.startsWith('video/') ||
+      /\.(mp4|webm|mov|m4v|mkv|avi|flv|3gp|ts|ogv)$/i.test(file.name);
+    if (!isLikelyVideo) {
+      showToast('请选择视频文件（如 MP4、MOV、WebM、M4V、MKV 等）');
+      if (fileInputRef.current) fileInputRef.current.value = '';
+      return;
+    }
     setUploading(true);
     try {
       await uploadTrackMvFile(currentTrack.id, file);
@@ -496,6 +505,11 @@ export const MvPage: React.FC = () => {
                 <p className="text-sm text-white/75">
                   当前歌曲还没有可用 MV，请先上传视频文件（推荐 MP4 / WebM），即可开启前瞻、中段和后段剧情同步。
                 </p>
+                {pendingMvTimelines.length > 0 && (
+                  <p className="text-xs text-emerald-300/90">
+                    已检测到 {pendingMvTimelines.length} 条来自备份导入的 MV 前瞻 / 后段时间预设正在等待匹配，上传对应视频后将自动对应恢复！
+                  </p>
+                )}
                 <button
                   type="button"
                   onClick={() => setActiveTab('upload')}
@@ -1091,12 +1105,16 @@ export const MvPage: React.FC = () => {
               </h2>
             </div>
             <p className="text-xs text-white/65 leading-relaxed">
-              支持 MP4、WebM、MOV、M4V。视频文件保存在当前浏览器的本地数据库中，主网页保留音乐音频并在切换到「独立新网页播放」时无损跨标签页共享渲染，无需重复上传。
+              支持 MP4、WebM、MOV、M4V 等视频格式，可直接从手机文件管理或系统相册中选择本地视频。文件保存在当前浏览器的本地数据库中，主网页保留音乐音频并在切换到「独立新网页播放」时无损跨标签页共享渲染，无需重复上传。
             </p>
+            {pendingMvTimelines.length > 0 && (
+              <div className="rounded-2xl bg-emerald-500/10 border border-emerald-400/25 px-3.5 py-2.5 text-xs text-emerald-100 leading-relaxed">
+                当前有 <strong>{pendingMvTimelines.length}</strong> 条来自导入备份的 MV 前瞻/后端时间预设正在等待匹配，导入对应视频后将自动恢复其前瞻时间与后段尾声时间。
+              </div>
+            )}
             <input
               ref={fileInputRef}
               type="file"
-              accept="video/mp4,video/webm,video/quicktime,video/x-m4v,.mp4,.webm,.mov,.m4v"
               className="hidden"
               onChange={(e) => handleFileUpload(e.target.files)}
             />

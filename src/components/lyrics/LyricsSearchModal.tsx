@@ -172,7 +172,18 @@ export const LyricsSearchModal: React.FC<LyricsSearchModalProps> = ({
     }
 
     // 4. 调用 AI 模型翻译没有双语的歌词
-    const providerName = activeProvider?.name || 'Gemini';
+    if (activeProvider && !activeProvider.enabled) {
+      setError(`所选服务商「${activeProvider.name}」已被禁用，请先在 AI 智能中心启用。`);
+      setFailedTranslationId(item.id);
+      return;
+    }
+    if (activeProvider && !activeProvider.hasKey) {
+      setError(`所选服务商「${activeProvider.name}」尚未配置 API Key，请前往「AI 智能中心 → API 服务管理」填写您的密钥。`);
+      setFailedTranslationId(item.id);
+      return;
+    }
+
+    const providerName = activeProvider?.name || '内置 Gemini';
     const modelToUse = selectedModel || activeProvider?.model || 'gemini-4-hydrogen';
     const styleLabel =
       LYRIC_TRANSLATION_STYLES.find((s) => s.id === translationStyle)?.label ||
@@ -219,14 +230,19 @@ export const LyricsSearchModal: React.FC<LyricsSearchModalProps> = ({
         modelToUse
       );
 
+      const usedProvider = res.providerName || providerName;
+      const usedModel = res.modelUsed || modelToUse;
+
       if (taskId) {
         finishTask(taskId, 'completed', {
-          resultSummary: `已完成 ${res.translatedCount} 行歌词翻译 (${styleLabel})`,
+          providerName: usedProvider,
+          modelName: usedModel,
+          resultSummary: `已使用 ${usedProvider} (${usedModel}) 完成 ${res.translatedCount} 行歌词翻译 (${styleLabel})`,
           resultData: {
             bilingualLyrics: res.bilingualLyrics,
             translatedCount: res.translatedCount,
-            provider: providerName,
-            model: modelToUse,
+            provider: usedProvider,
+            model: usedModel,
             style: translationStyle,
           },
         });
@@ -237,7 +253,7 @@ export const LyricsSearchModal: React.FC<LyricsSearchModalProps> = ({
 
       if (res.translatedCount > 0) {
         showToast(
-          `已使用 ${providerName} (${styleLabel}) 完成 ${res.translatedCount} 行歌词翻译并同步时间轴`
+          `已使用 ${usedProvider} (${styleLabel}) 完成 ${res.translatedCount} 行歌词翻译并同步时间轴`
         );
       } else {
         showToast('歌词翻译已就绪');

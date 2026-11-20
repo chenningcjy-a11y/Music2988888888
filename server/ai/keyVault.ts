@@ -367,11 +367,19 @@ export async function getStoredProviderWithKey(providerId?: string): Promise<{
   apiKey: string;
 } | null> {
   const vault = await loadVault();
-  const targetId = providerId || vault.defaultProviderId;
-  const found =
-    vault.providers.find((p) => p.id === targetId) ||
-    vault.providers.find((p) => p.enabled && p.hasKey) ||
-    null;
+  let found: StoredAiProvider | null = null;
+  if (providerId) {
+    found = vault.providers.find((p) => p.id === providerId) || null;
+  } else {
+    const def = vault.defaultProviderId
+      ? vault.providers.find((p) => p.id === vault.defaultProviderId) || null
+      : null;
+    found =
+      (def && def.enabled && def.hasKey ? def : null) ||
+      vault.providers.find((p) => p.enabled && p.hasKey) ||
+      def ||
+      null;
+  }
   if (!found) return null;
   const apiKey = await decryptString(found.encryptedApiKey);
   return { provider: found, apiKey };

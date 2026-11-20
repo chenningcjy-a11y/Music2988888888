@@ -1,6 +1,7 @@
 import { AiTaskRecord } from '../types/ai';
 import {
   AudioDspSettings,
+  PendingMvTimelineRecord,
   PersonalizationSettings,
   PlaybackPrefs,
   Playlist,
@@ -92,13 +93,17 @@ export async function getAllTracks(): Promise<TrackMetadata[]> {
 
 export async function saveTrackWithBlob(
   track: TrackMetadata,
-  blob: Blob
+  blob?: Blob
 ): Promise<void> {
   const db = await openDatabase();
+  const hasValidBlob = Boolean(blob && blob.size > 0);
   return new Promise((resolve, reject) => {
-    const tx = db.transaction([STORE_TRACKS, STORE_BLOBS], 'readwrite');
+    const stores = hasValidBlob ? [STORE_TRACKS, STORE_BLOBS] : [STORE_TRACKS];
+    const tx = db.transaction(stores, 'readwrite');
     tx.objectStore(STORE_TRACKS).put(track);
-    tx.objectStore(STORE_BLOBS).put(blob, track.id);
+    if (hasValidBlob && blob) {
+      tx.objectStore(STORE_BLOBS).put(blob, track.id);
+    }
     tx.oncomplete = () => resolve();
     tx.onerror = () => {
       const err = tx.error;
@@ -308,7 +313,7 @@ export async function clearAllMusicData(): Promise<void> {
   const db = await openDatabase();
   return new Promise((resolve, reject) => {
     const tx = db.transaction(
-      [STORE_TRACKS, STORE_BLOBS, STORE_PLAYLISTS, STORE_STEMS, STORE_MVS, STORE_MV_BLOBS],
+      [STORE_TRACKS, STORE_BLOBS, STORE_PLAYLISTS, STORE_STEMS, STORE_MVS, STORE_MV_BLOBS, STORE_SETTINGS],
       'readwrite'
     );
     tx.objectStore(STORE_TRACKS).clear();
@@ -317,9 +322,33 @@ export async function clearAllMusicData(): Promise<void> {
     tx.objectStore(STORE_STEMS).clear();
     tx.objectStore(STORE_MVS).clear();
     tx.objectStore(STORE_MV_BLOBS).clear();
+    tx.objectStore(STORE_SETTINGS).delete('pendingMvTimelines');
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });
+}
+
+export async function clearTracksStore(): Promise<void> {
+  const db = await openDatabase();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction([STORE_TRACKS, STORE_BLOBS], 'readwrite');
+    tx.objectStore(STORE_TRACKS).clear();
+    tx.objectStore(STORE_BLOBS).clear();
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+export async function clearPlaylistsStore(): Promise<void> {
+  const db = await openDatabase();
+  const tx = db.transaction(STORE_PLAYLISTS, 'readwrite');
+  await wrapRequest(tx.objectStore(STORE_PLAYLISTS).clear());
+}
+
+export async function clearStemsStore(): Promise<void> {
+  const db = await openDatabase();
+  const tx = db.transaction(STORE_STEMS, 'readwrite');
+  await wrapRequest(tx.objectStore(STORE_STEMS).clear());
 }
 
 export async function getAllAiTasks(): Promise<AiTaskRecord[]> {
@@ -576,4 +605,225 @@ export async function clearAllMvs(): Promise<void> {
     tx.onerror = () => reject(tx.error);
   });
 }
+
+// ---------- Deferred / Pending MV Timeline Presets (cross-device sync before MV video upload) ----------
+
+const PENDING_MV_TIMELINES_KEY = 'pendingMvTimelines';
+
+function normalizeMatchText(value?: string): string {
+  return (value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ' ');
+}
+
+function stripFileExtension(fileName?: string): string {
+  return normalizeMatchText(fileName).replace(/\.[^/.]+$/, '');
+}
+
+export async function loadPendingMvTimelines(): Promise<PendingMvTimelineRecord[]> {
+  try {
+    const db = await openDatabase();
+    const tx = db.transaction(STORE_SETTINGS, 'readonly');
+    const raw = await wrapRequest(
+      tx.objectStore(STORE_SETTINGS).get(PENDING_MV_TIMELINES_KEY)
+    );
+    if (!Array.isArray(raw)) return [];
+    return (raw as PendingMvTimelineRecord[])
+      .filter((item) => Boolean(item && item.id && item.timeline))
+      .sort((a, b) => (b.savedAt || 0) - (a.savedAt || 0));
+  } catch {
+    return [];
+  }
+}
+
+export async function savePendingMvTimelines(
+  items: PendingMvTimelineRecord[]
+): Promise<void> {
+  await setSetting(PENDING_MV_TIMELINES_KEY, items);
+}
+
+export async function upsertPendingMvTimelinesBatch(
+  incoming: PendingMvTimelineRecord[]
+): Promise<number> {
+  if (incoming.length === 0) return 0;
+  const existing = await loadPendingMvTimelines();
+  const next = [...existing];
+  let addedOrUpdated = 0;
+
+  for (const item of incoming) {
+    if (!item || !item.timeline) continue;
+    const normFile = normalizeMatchText(item.fileName);
+    const normTrackTitle = normalizeMatchText(item.trackTitle);
+    const normTrackArtist = normalizeMatchText(item.trackArtist);
+    const normMvTitle = normalizeMatchText(item.mvTitle);
+
+    const idx = next.findIndex((cur) => {
+      if (cur.id === item.id) return true;
+      if (normFile && normalizeMatchText(cur.fileName) === normFile) {
+        if (!normTrackTitle || !normalizeMatchText(cur.trackTitle)) return true;
+        if (normalizeMatchText(cur.trackTitle) === normTrackTitle) return true;
+      }
+      if (
+        item.trackId &&
+        cur.trackId === item.trackId &&
+        normMvTitle &&
+        normalizeMatchText(cur.mvTitle) === normMvTitle
+      ) {
+        return true;
+      }
+      if (
+        normTrackTitle &&
+        normalizeMatchText(cur.trackTitle) === normTrackTitle &&
+        normalizeMatchText(cur.trackArtist) === normTrackArtist &&
+        normMvTitle &&
+        normalizeMatchText(cur.mvTitle) === normMvTitle
+      ) {
+        return true;
+      }
+      return false;
+    });
+
+    if (idx >= 0) {
+      next[idx] = { ...next[idx], ...item, savedAt: item.savedAt || Date.now() };
+    } else {
+      next.unshift({
+        ...item,
+        savedAt: item.savedAt || Date.now(),
+      });
+    }
+    addedOrUpdated++;
+  }
+
+  await savePendingMvTimelines(next.slice(0, 300));
+  return addedOrUpdated;
+}
+
+export async function removePendingMvTimelineById(id: string): Promise<void> {
+  const existing = await loadPendingMvTimelines();
+  const filtered = existing.filter((item) => item.id !== id);
+  if (filtered.length !== existing.length) {
+    await savePendingMvTimelines(filtered);
+  }
+}
+
+export async function clearPendingMvTimelines(): Promise<void> {
+  await savePendingMvTimelines([]);
+}
+
+export async function matchAndConsumePendingMvTimeline(candidate: {
+  trackId?: string;
+  trackTitle?: string;
+  trackArtist?: string;
+  fileName?: string;
+  mvTitle?: string;
+  fileSizeBytes?: number;
+  durationSec?: number;
+}): Promise<PendingMvTimelineRecord | null> {
+  const pending = await loadPendingMvTimelines();
+  if (pending.length === 0) return null;
+
+  const candFile = normalizeMatchText(candidate.fileName);
+  const candStem = stripFileExtension(candidate.fileName);
+  const candMvTitle = normalizeMatchText(candidate.mvTitle) || candStem;
+  const candTrackTitle = normalizeMatchText(candidate.trackTitle);
+  const candTrackArtist = normalizeMatchText(candidate.trackArtist);
+
+  let bestIdx = -1;
+  let bestScore = 0;
+
+  for (let i = 0; i < pending.length; i++) {
+    const p = pending[i];
+    const pFile = normalizeMatchText(p.fileName);
+    const pStem = stripFileExtension(p.fileName);
+    const pMvTitle = normalizeMatchText(p.mvTitle) || pStem;
+    const pTrackTitle = normalizeMatchText(p.trackTitle);
+    const pTrackArtist = normalizeMatchText(p.trackArtist);
+
+    const exactFileMatch = Boolean(candFile && pFile && candFile === pFile);
+    const exactSizeMatch = Boolean(
+      candidate.fileSizeBytes &&
+        p.fileSizeBytes &&
+        candidate.fileSizeBytes > 0 &&
+        candidate.fileSizeBytes === p.fileSizeBytes
+    );
+    const stemMatch = Boolean(candStem && pStem && candStem === pStem);
+
+    // Avoid cross-song mismatches when uploading an unrelated file onto a different track
+    if (
+      !exactFileMatch &&
+      !exactSizeMatch &&
+      pTrackTitle &&
+      candTrackTitle &&
+      pTrackTitle !== candTrackTitle
+    ) {
+      continue;
+    }
+
+    let score = 0;
+    if (exactFileMatch) score += 100;
+    else if (stemMatch) score += 65;
+
+    if (exactSizeMatch) score += 80;
+
+    const exactTrackMatch = Boolean(
+      candidate.trackId && p.trackId && candidate.trackId === p.trackId
+    );
+    const exactTrackTitleMatch = Boolean(
+      candTrackTitle && pTrackTitle && candTrackTitle === pTrackTitle
+    );
+
+    if (exactTrackMatch) {
+      score += 55;
+    }
+
+    if (exactTrackTitleMatch) {
+      if (!pTrackArtist || !candTrackArtist || pTrackArtist === candTrackArtist) {
+        score += 60;
+      } else {
+        score += 45;
+      }
+    }
+
+    if (candMvTitle && pMvTitle && candMvTitle === pMvTitle) {
+      score += 35;
+    } else if (
+      candTrackTitle &&
+      pMvTitle &&
+      (pMvTitle.includes(candTrackTitle) || candTrackTitle.includes(pMvTitle))
+    ) {
+      score += 25;
+    }
+
+    if (
+      candidate.durationSec &&
+      p.durationSec &&
+      candidate.durationSec > 0 &&
+      p.durationSec > 0 &&
+      Math.abs(candidate.durationSec - p.durationSec) <= 2.5
+    ) {
+      score += 25;
+    }
+
+    const qualified =
+      exactFileMatch ||
+      exactSizeMatch ||
+      exactTrackMatch ||
+      exactTrackTitleMatch ||
+      score >= 55;
+
+    if (qualified && score > bestScore) {
+      bestScore = score;
+      bestIdx = i;
+    }
+  }
+
+  if (bestIdx < 0) return null;
+
+  const matched = pending[bestIdx];
+  const remaining = pending.filter((_, idx) => idx !== bestIdx);
+  await savePendingMvTimelines(remaining);
+  return matched;
+}
+
 

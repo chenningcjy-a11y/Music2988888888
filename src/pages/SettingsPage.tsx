@@ -1,13 +1,16 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Bot,
+  CheckCircle2,
+  ChevronDown,
   ChevronRight,
+  ChevronUp,
+  Clock,
   Database,
   Download,
   KeyRound,
   Palette,
   RefreshCw,
-  Sparkles,
   Trash2,
   Type,
   Upload,
@@ -17,11 +20,23 @@ import { useAi } from '../context/AiContext';
 import { useMusic } from '../context/MusicContext';
 import { useTaskCenter } from '../context/TaskCenterContext';
 import {
-  exportFullLuminaBackup,
-  importFullLuminaBackup,
+  BackupLocalInventory,
+  DEFAULT_BACKUP_EXPORT_OPTIONS,
+  exportLuminaBackupBlob,
+  getBackupLocalInventory,
+  importLuminaBackup,
+  InspectedBackupFile,
+  inspectLuminaBackupFile,
+  LIGHTWEIGHT_BACKUP_OPTIONS,
+  MV_TIMELINE_ONLY_BACKUP_OPTIONS,
 } from '../services/backupService';
 import { getStorageEstimate } from '../services/storage';
-import { AnimationIntensity, FontPresetId, ThemePresetId } from '../types/music';
+import {
+  AnimationIntensity,
+  BackupSelectionOptions,
+  FontPresetId,
+  ThemePresetId,
+} from '../types/music';
 import { formatFileSize } from '../utils/constants';
 
 const THEME_OPTIONS: {
@@ -106,39 +121,88 @@ export const SettingsPage: React.FC = () => {
     updatePersonalization,
     activePalette,
     tracks,
-    loadDemoLibrary,
+    pendingMvTimelines,
+    removePendingMvTimeline,
     resetLibrary,
     reloadAllLibraryData,
     showToast,
   } = useMusic();
-  const { activeProvider, activeStemService, openAiCenter } = useAi();
+  const {
+    activeProvider,
+    activeStemService,
+    openAiCenter,
+    refreshProviders,
+    refreshStemServices,
+  } = useAi();
   const { reloadTasksFromStorage } = useTaskCenter();
 
   const [storageInfo, setStorageInfo] = useState<{
     usageBytes: number;
     quotaBytes: number;
   }>({ usageBytes: 0, quotaBytes: 0 });
+  const [inventory, setInventory] = useState<BackupLocalInventory | null>(null);
   const [confirmReset, setConfirmReset] = useState(false);
   const [backupBusy, setBackupBusy] = useState(false);
+  const [backupProgress, setBackupProgress] = useState<string | null>(null);
   const [backupNotice, setBackupNotice] = useState<string | null>(null);
+  const [activeBackupPanel, setActiveBackupPanel] = useState<'none' | 'export' | 'import'>('none');
+  const [exportOptions, setExportOptions] = useState<BackupSelectionOptions>({
+    ...DEFAULT_BACKUP_EXPORT_OPTIONS,
+  });
+  const [inspectedImport, setInspectedImport] = useState<InspectedBackupFile | null>(null);
+  const [importOptions, setImportOptions] = useState<BackupSelectionOptions>({
+    ...DEFAULT_BACKUP_EXPORT_OPTIONS,
+  });
+  const [importMode, setImportMode] = useState<'merge' | 'replace'>('merge');
+  const [showPendingMvList, setShowPendingMvList] = useState(false);
   const importInputRef = useRef<HTMLInputElement | null>(null);
 
-  const refreshStorage = async () => {
-    const est = await getStorageEstimate();
+  const refreshStorage = useCallback(async () => {
+    const [est, inv] = await Promise.all([
+      getStorageEstimate(),
+      getBackupLocalInventory().catch(() => null),
+    ]);
     setStorageInfo(est);
-  };
+    if (inv) setInventory(inv);
+  }, []);
 
   useEffect(() => {
-    refreshStorage();
-  }, [tracks.length]);
+    void refreshStorage();
+  }, [tracks.length, pendingMvTimelines.length, refreshStorage]);
 
-  const handleExportBackup = async () => {
+  const estimatedExportBytes = useMemo(() => {
+    if (!inventory) return 0;
+    let total = 0;
+    if (exportOptions.includeTrackAudio) total += inventory.tracksAudioBytes;
+    if (exportOptions.includeMvVideos) total += inventory.mvVideosBytes;
+    if (exportOptions.includeStems) total += inventory.stemsBytes;
+    // Base64 overhead (~1.34x binary) + metadata ~150KB
+    return Math.round(total * 1.34) + 150 * 1024;
+  }, [inventory, exportOptions]);
+
+  const hasAnyExportSelected = useMemo(
+    () => Object.values(exportOptions).some(Boolean),
+    [exportOptions]
+  );
+
+  const hasAnyImportSelected = useMemo(
+    () => Object.values(importOptions).some(Boolean),
+    [importOptions]
+  );
+
+  const handleConfirmExportBackup = async () => {
+    if (!hasAnyExportSelected) {
+      showToast('请至少勾选一项要导出的数据');
+      return;
+    }
     setBackupBusy(true);
     setBackupNotice(null);
+    setBackupProgress('正在初始化流式导出...');
     try {
-      const { bundle, filename } = await exportFullLuminaBackup();
-      const json = JSON.stringify(bundle);
-      const blob = new Blob([json], { type: 'application/json' });
+      const { blob, filename, manifest } = await exportLuminaBackupBlob(
+        exportOptions,
+        (msg) => setBackupProgress(msg)
+      );
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
@@ -146,20 +210,21 @@ export const SettingsPage: React.FC = () => {
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
-      window.setTimeout(() => URL.revokeObjectURL(url), 4000);
-      const msg = `已导出完整备份：${bundle.tracks.length} 首歌曲、${bundle.stems.length} 组分离音轨、${bundle.aiTasks.length} 条任务记录（不含 API 密钥）`;
+      window.setTimeout(() => URL.revokeObjectURL(url), 6000);
+      const msg = `已导出数据包（${formatFileSize(blob.size)}）：${manifest.tracksMetaCount} 首曲目信息（含 ${manifest.tracksAudioCount} 份音频）、${manifest.playlistsCount} 个歌单、${manifest.mvTimelinesCount} 条 MV 时间轴配置（含 ${manifest.mvVideosCount} 个视频）、${manifest.stemsCount} 组分离音轨、${manifest.aiTasksCount} 条 AI 任务记录（不含 API 密钥）`;
       setBackupNotice(msg);
-      showToast('完整备份已导出');
+      showToast('数据已成功导出');
     } catch (err) {
       const msg = err instanceof Error ? err.message : '导出备份失败';
       setBackupNotice(msg);
       showToast(msg);
     } finally {
       setBackupBusy(false);
+      setBackupProgress(null);
     }
   };
 
-  const handleImportBackupFile = async (
+  const handleSelectImportFile = async (
     e: React.ChangeEvent<HTMLInputElement>
   ) => {
     const file = e.target.files?.[0];
@@ -167,25 +232,104 @@ export const SettingsPage: React.FC = () => {
     if (!file) return;
     setBackupBusy(true);
     setBackupNotice(null);
+    setBackupProgress('正在扫描备份文件内容...');
     try {
-      const text = await file.text();
-      const summary = await importFullLuminaBackup(text);
+      const inspected = await inspectLuminaBackupFile(file);
+      setInspectedImport(inspected);
+      setImportOptions({ ...inspected.availableOptions });
+      setActiveBackupPanel('import');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : '解析备份文件失败';
+      setBackupNotice(msg);
+      showToast(msg);
+    } finally {
+      setBackupBusy(false);
+      setBackupProgress(null);
+    }
+  };
+
+  const handleConfirmImportBackup = async () => {
+    if (!inspectedImport) return;
+    if (!hasAnyImportSelected) {
+      showToast('请至少勾选一项要导入的数据');
+      return;
+    }
+    setBackupBusy(true);
+    setBackupNotice(null);
+    setBackupProgress('正在导入并自动保存...');
+    try {
+      const summary = await importLuminaBackup(
+        inspectedImport.file,
+        importOptions,
+        importMode,
+        (msg) => setBackupProgress(msg)
+      );
       await reloadAllLibraryData();
       await reloadTasksFromStorage();
-      await refreshStorage();
-      const msg = `已恢复 ${summary.tracksRestored} 首曲目、${summary.playlistsRestored} 个歌单、${summary.stemsRestored} 组分离音轨、${summary.tasksRestored} 条任务记录${
-        summary.tasksNormalizedToResubmit > 0
-          ? `（其中 ${summary.tasksNormalizedToResubmit} 个原进行中任务已标记为「等待重新提交」）`
-          : ''
-      }`;
+      await Promise.all([
+        refreshProviders().catch(() => {}),
+        refreshStemServices().catch(() => {}),
+        refreshStorage(),
+      ]);
+
+      const parts: string[] = [];
+      if (summary.tracksRestored > 0) {
+        parts.push(
+          `${summary.tracksRestored} 首曲目${
+            summary.trackAudioRestored > 0
+              ? `（含 ${summary.trackAudioRestored} 份音频）`
+              : '（仅信息/歌词与偏移）'
+          }`
+        );
+      }
+      if (summary.playlistsRestored > 0) parts.push(`${summary.playlistsRestored} 个歌单`);
+      if (summary.stemsRestored > 0) parts.push(`${summary.stemsRestored} 组分离音轨`);
+      if (summary.mvsRestored > 0) {
+        parts.push(
+          `${summary.mvsRestored} 条 MV 配置${
+            summary.mvVideosRestored > 0
+              ? `（含 ${summary.mvVideosRestored} 个视频）`
+              : summary.mvTimelinesMatchedExisting > 0
+              ? `（${summary.mvTimelinesMatchedExisting} 条已直接应用到现有 MV）`
+              : ''
+          }`
+        );
+      }
+      if (summary.pendingMvsStored > 0) {
+        parts.push(
+          `${summary.pendingMvsStored} 条未上传视频的 MV 前瞻/后端时间已自动暂存（导入对应 MV 时自动匹配生效）`
+        );
+      }
+      if (summary.audioSettingsRestored) parts.push('音效与 DSP 调音参数');
+      if (summary.personalizationRestored) parts.push('个性化外观与播放偏好');
+      if (summary.tasksRestored > 0) {
+        parts.push(
+          `${summary.tasksRestored} 条任务记录${
+            summary.tasksNormalizedToResubmit > 0
+              ? `（${summary.tasksNormalizedToResubmit} 个原进行中任务已标记重新提交）`
+              : ''
+          }`
+        );
+      }
+      if (summary.aiProvidersSynced > 0) {
+        parts.push(`${summary.aiProvidersSynced} 项 AI 服务配置`);
+      }
+
+      const msg =
+        parts.length > 0
+          ? `已自动保存并恢复：${parts.join('、')}。`
+          : '所选数据类别在备份文件中均为空，已完成检查。';
       setBackupNotice(msg);
-      showToast('备份恢复完成');
+      setInspectedImport(null);
+      setActiveBackupPanel('none');
+      showToast('导入完成并已自动保存');
     } catch (err) {
       const msg = err instanceof Error ? err.message : '导入备份失败';
       setBackupNotice(msg);
       showToast(msg);
     } finally {
       setBackupBusy(false);
+      setBackupProgress(null);
     }
   };
 
@@ -520,38 +664,64 @@ export const SettingsPage: React.FC = () => {
           </div>
         </div>
 
-        {backupNotice && (
-          <div className="p-3 rounded-xl bg-white/[0.06] border border-white/12 text-xs text-white/85 leading-relaxed">
-            {backupNotice}
+        {backupProgress && (
+          <div className="p-3 rounded-xl bg-white/[0.08] border border-white/20 text-xs text-white flex items-center gap-2.5">
+            <RefreshCw className="w-3.5 h-3.5 animate-spin shrink-0" />
+            <span>{backupProgress}</span>
           </div>
         )}
 
-        <div className="flex flex-wrap items-center gap-3 pt-2">
+        {backupNotice && (
+          <div className="p-3.5 rounded-xl bg-white/[0.06] border border-white/15 text-xs text-white/90 leading-relaxed flex items-start gap-2">
+            <CheckCircle2
+              className="w-4 h-4 shrink-0 mt-0.5"
+              style={{ color: activePalette.primary }}
+            />
+            <span>{backupNotice}</span>
+          </div>
+        )}
+
+        <div className="flex flex-wrap items-center gap-3 pt-1">
           <input
             ref={importInputRef}
             type="file"
-            accept=".json"
+            accept=".json,application/json"
             className="hidden"
-            onChange={handleImportBackupFile}
+            onChange={handleSelectImportFile}
           />
           <button
             type="button"
             disabled={backupBusy}
             onClick={() => importInputRef.current?.click()}
-            className="px-4 py-2.5 rounded-xl bg-white/10 hover:bg-white/16 border border-white/15 text-xs font-medium text-white flex items-center gap-2 cursor-pointer disabled:opacity-50"
+            className={`px-4 py-2.5 rounded-xl border text-xs font-medium text-white flex items-center gap-2 cursor-pointer disabled:opacity-50 transition-colors ${
+              activeBackupPanel === 'import'
+                ? 'bg-white/20 border-white/35'
+                : 'bg-white/10 hover:bg-white/16 border-white/15'
+            }`}
           >
             <Upload className="w-4 h-4" />
-            <span>导入备份还原</span>
+            <span>导入数据 (可选与自动保存)</span>
           </button>
 
           <button
             type="button"
             disabled={backupBusy}
-            onClick={handleExportBackup}
-            className="px-4 py-2.5 rounded-xl bg-white/10 hover:bg-white/16 border border-white/15 text-xs font-medium text-white flex items-center gap-2 cursor-pointer disabled:opacity-50"
+            onClick={() =>
+              setActiveBackupPanel((prev) => (prev === 'export' ? 'none' : 'export'))
+            }
+            className={`px-4 py-2.5 rounded-xl border text-xs font-medium text-white flex items-center gap-2 cursor-pointer disabled:opacity-50 transition-colors ${
+              activeBackupPanel === 'export'
+                ? 'bg-white/20 border-white/35'
+                : 'bg-white/10 hover:bg-white/16 border-white/15'
+            }`}
           >
             <Download className="w-4 h-4" />
-            <span>导出完整备份 (JSON)</span>
+            <span>选择数据导出 (JSON)</span>
+            {activeBackupPanel === 'export' ? (
+              <ChevronUp className="w-3.5 h-3.5 opacity-80" />
+            ) : (
+              <ChevronDown className="w-3.5 h-3.5 opacity-80" />
+            )}
           </button>
 
           <div className="ml-auto flex items-center gap-2">
@@ -590,6 +760,411 @@ export const SettingsPage: React.FC = () => {
             )}
           </div>
         </div>
+
+        {/* Selectable Export Options Drawer */}
+        {activeBackupPanel === 'export' && (
+          <div className="rounded-2xl bg-black/30 border border-white/15 p-4 sm:p-5 space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <h3 className="text-sm font-semibold text-white">
+                  选择要导出的数据与调整项
+                </h3>
+                <p className="text-xs text-white/55 mt-0.5">
+                  支持分块流式打包大体积音视频；若需快速同步设置、歌词与 MV 前瞻/后端时间，可选用「轻量同步」
+                </p>
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => setExportOptions({ ...DEFAULT_BACKUP_EXPORT_OPTIONS })}
+                  className="px-2.5 py-1.5 rounded-lg bg-white/10 hover:bg-white/18 text-[11px] text-white cursor-pointer"
+                >
+                  全选完整数据
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setExportOptions({ ...LIGHTWEIGHT_BACKUP_OPTIONS })}
+                  className="px-2.5 py-1.5 rounded-lg bg-white/10 hover:bg-white/18 text-[11px] text-white cursor-pointer"
+                >
+                  轻量同步 (不含音视频大文件)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setExportOptions({ ...MV_TIMELINE_ONLY_BACKUP_OPTIONS })}
+                  className="px-2.5 py-1.5 rounded-lg bg-white/10 hover:bg-white/18 text-[11px] text-white cursor-pointer"
+                >
+                  仅 MV 前瞻/后端时间
+                </button>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+              {(
+                [
+                  {
+                    key: 'includeTracksMeta',
+                    title: '新增曲目信息与歌词微调',
+                    desc: `${inventory?.tracksMetaCount ?? tracks.length} 首（曲目信息、封面、收藏、编辑/翻译歌词、歌词时间偏移）`,
+                  },
+                  {
+                    key: 'includeTrackAudio',
+                    title: '歌曲音频文件本体',
+                    desc: `${inventory?.tracksAudioCount ?? 0} 份 · ${formatFileSize(
+                      inventory?.tracksAudioBytes ?? 0
+                    )}（MP3 / FLAC / WAV 等原始音频）`,
+                  },
+                  {
+                    key: 'includePlaylists',
+                    title: '自建播放列表与歌单排序',
+                    desc: `${inventory?.playlistsCount ?? 0} 个歌单`,
+                  },
+                  {
+                    key: 'includeMvTimelines',
+                    title: 'MV 前瞻时间、后段时间与剧场调整',
+                    desc: `${inventory?.mvTimelinesCount ?? 0} 项（前瞻起点、后段尾声、中段断点、模糊/透明度、外链与待匹配预设）`,
+                  },
+                  {
+                    key: 'includeMvVideos',
+                    title: 'MV 本地视频文件本体',
+                    desc: `${inventory?.mvVideosCount ?? 0} 个视频 · ${formatFileSize(
+                      inventory?.mvVideosBytes ?? 0
+                    )}`,
+                  },
+                  {
+                    key: 'includeStems',
+                    title: 'AI 分离人声/伴奏缓存音轨',
+                    desc: `${inventory?.stemsCount ?? 0} 组 · ${formatFileSize(
+                      inventory?.stemsBytes ?? 0
+                    )}`,
+                  },
+                  {
+                    key: 'includeAudioSettings',
+                    title: '音质与 DSP 音效调整',
+                    desc: '7 段均衡器 EQ、3D 环绕、耳机优化、混响、低高音与人声平衡比例',
+                  },
+                  {
+                    key: 'includePersonalization',
+                    title: '界面个性化与播放偏好',
+                    desc: '主题色彩、界面字体、动态光效、液态波浪、MV UI 淡入淡出与循环模式',
+                  },
+                  {
+                    key: 'includeAiData',
+                    title: 'AI 服务商配置与任务中心记录',
+                    desc: `${inventory?.aiProvidersCount ?? 0} 个 AI 服务、${
+                      inventory?.aiTasksCount ?? 0
+                    } 条任务记录（不含 API 密钥）`,
+                  },
+                ] as {
+                  key: keyof BackupSelectionOptions;
+                  title: string;
+                  desc: string;
+                }[]
+              ).map((item) => (
+                <label
+                  key={item.key}
+                  className="flex items-start justify-between gap-3 p-3 rounded-xl bg-white/[0.04] border border-white/10 hover:bg-white/[0.07] cursor-pointer"
+                >
+                  <div>
+                    <span className="text-xs font-medium text-white block">
+                      {item.title}
+                    </span>
+                    <span className="text-[11px] text-white/55 block mt-0.5 leading-relaxed">
+                      {item.desc}
+                    </span>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={exportOptions[item.key]}
+                    onChange={(e) =>
+                      setExportOptions((prev) => ({
+                        ...prev,
+                        [item.key]: e.target.checked,
+                      }))
+                    }
+                    className="accent-rose-500 w-4 h-4 mt-0.5 shrink-0"
+                  />
+                </label>
+              ))}
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-white/10">
+              <span className="text-xs text-white/65 font-mono-tabular">
+                预计导出体积：约 {formatFileSize(estimatedExportBytes)}
+                {estimatedExportBytes > 180 * 1024 * 1024
+                  ? '（体积较大，已自动启用分块流式打包）'
+                  : ''}
+              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  disabled={backupBusy}
+                  onClick={() => setActiveBackupPanel('none')}
+                  className="px-3.5 py-2 rounded-xl bg-white/8 hover:bg-white/14 text-xs text-white/80 cursor-pointer"
+                >
+                  收起
+                </button>
+                <button
+                  type="button"
+                  disabled={backupBusy || !hasAnyExportSelected}
+                  onClick={handleConfirmExportBackup}
+                  className="px-4 py-2 rounded-xl text-xs font-semibold text-white flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                  style={{
+                    background: `linear-gradient(135deg, ${activePalette.primary}, ${activePalette.secondary})`,
+                  }}
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>确认导出数据包</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Selectable Import Options & Auto-Save Confirmation Drawer */}
+        {activeBackupPanel === 'import' && inspectedImport && (
+          <div className="rounded-2xl bg-black/30 border border-white/15 p-4 sm:p-5 space-y-4">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <h3 className="text-sm font-semibold text-white">
+                  选择要导入并自动保存的数据项
+                </h3>
+                <p className="text-xs text-white/60 mt-0.5">
+                  文件：{inspectedImport.fileName}（{formatFileSize(inspectedImport.fileSizeBytes)}）
+                  {inspectedImport.exportedAt
+                    ? ` · 导出时间：${new Date(inspectedImport.exportedAt).toLocaleString()}`
+                    : ''}
+                </p>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => setImportMode('merge')}
+                  className={`px-3 py-1.5 rounded-lg text-[11px] font-medium border cursor-pointer ${
+                    importMode === 'merge'
+                      ? 'bg-white/20 border-white/35 text-white'
+                      : 'bg-white/5 border-white/10 text-white/65 hover:text-white'
+                  }`}
+                >
+                  智能合并与覆盖同项 (推荐)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setImportMode('replace')}
+                  className={`px-3 py-1.5 rounded-lg text-[11px] font-medium border cursor-pointer ${
+                    importMode === 'replace'
+                      ? 'bg-rose-500/25 border-rose-400/50 text-rose-100'
+                      : 'bg-white/5 border-white/10 text-white/65 hover:text-white'
+                  }`}
+                >
+                  清空所选类别后写入
+                </button>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+              {(
+                [
+                  {
+                    key: 'includeTracksMeta',
+                    available: inspectedImport.availableOptions.includeTracksMeta,
+                    title: '增加的歌曲信息与歌词调整',
+                    desc: `包内含 ${inspectedImport.manifest.tracksMetaCount} 首曲目、封面、收藏与歌词/时间偏移`,
+                  },
+                  {
+                    key: 'includeTrackAudio',
+                    available: inspectedImport.availableOptions.includeTrackAudio,
+                    title: '歌曲音频文件本体',
+                    desc: `包内含 ${inspectedImport.manifest.tracksAudioCount} 份音频文件（导入即自动保存到本地曲库）`,
+                  },
+                  {
+                    key: 'includePlaylists',
+                    available: inspectedImport.availableOptions.includePlaylists,
+                    title: '增加的播放列表与歌单排序',
+                    desc: `包内含 ${inspectedImport.manifest.playlistsCount} 个歌单`,
+                  },
+                  {
+                    key: 'includeMvTimelines',
+                    available: inspectedImport.availableOptions.includeMvTimelines,
+                    title: 'MV 前瞻时间、后段时间与视效调整',
+                    desc: `包内含 ${inspectedImport.manifest.mvTimelinesCount} 条（若对应 MV 尚未导入，将自动暂存并在日后导入该 MV 时自动匹配）`,
+                  },
+                  {
+                    key: 'includeMvVideos',
+                    available: inspectedImport.availableOptions.includeMvVideos,
+                    title: 'MV 本地视频文件本体',
+                    desc: `包内含 ${inspectedImport.manifest.mvVideosCount} 个 MV 视频文件`,
+                  },
+                  {
+                    key: 'includeStems',
+                    available: inspectedImport.availableOptions.includeStems,
+                    title: 'AI 分离人声与伴奏缓存音轨',
+                    desc: `包内含 ${inspectedImport.manifest.stemsCount} 组分离音轨`,
+                  },
+                  {
+                    key: 'includeAudioSettings',
+                    available: inspectedImport.availableOptions.includeAudioSettings,
+                    title: '调整过的音质与 DSP 音效参数',
+                    desc: inspectedImport.manifest.hasAudioSettings
+                      ? '包含 7 段均衡器 EQ、环绕声、混响、人声/伴奏平衡等调整'
+                      : '此备份包未包含音质参数',
+                  },
+                  {
+                    key: 'includePersonalization',
+                    available: inspectedImport.availableOptions.includePersonalization,
+                    title: '调整过的个性化外观与播放偏好',
+                    desc: inspectedImport.manifest.hasPersonalization
+                      ? '包含主题流彩、字体、光效波浪、MV UI 淡入淡出时长与播放偏好'
+                      : '此备份包未包含个性化偏好',
+                  },
+                  {
+                    key: 'includeAiData',
+                    available: inspectedImport.availableOptions.includeAiData,
+                    title: 'AI 服务商配置与任务记录',
+                    desc: `包含 ${inspectedImport.manifest.aiProvidersCount} 个 AI 服务配置、${inspectedImport.manifest.aiTasksCount} 条任务记录（保留本机已有密钥）`,
+                  },
+                ] as {
+                  key: keyof BackupSelectionOptions;
+                  available: boolean;
+                  title: string;
+                  desc: string;
+                }[]
+              ).map((item) => (
+                <label
+                  key={item.key}
+                  className={`flex items-start justify-between gap-3 p-3 rounded-xl border ${
+                    item.available
+                      ? 'bg-white/[0.05] border-white/12 hover:bg-white/[0.08] cursor-pointer'
+                      : 'bg-white/[0.02] border-white/5 opacity-45 cursor-not-allowed'
+                  }`}
+                >
+                  <div>
+                    <span className="text-xs font-medium text-white block">
+                      {item.title}
+                    </span>
+                    <span className="text-[11px] text-white/55 block mt-0.5 leading-relaxed">
+                      {item.desc}
+                    </span>
+                  </div>
+                  <input
+                    type="checkbox"
+                    disabled={!item.available}
+                    checked={item.available && importOptions[item.key]}
+                    onChange={(e) =>
+                      setImportOptions((prev) => ({
+                        ...prev,
+                        [item.key]: e.target.checked,
+                      }))
+                    }
+                    className="accent-rose-500 w-4 h-4 mt-0.5 shrink-0"
+                  />
+                </label>
+              ))}
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-white/10">
+              <span className="text-[11px] text-white/60">
+                点击确认后将自动写入本地数据库并即时刷新生效，无需再手动保存。
+              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  disabled={backupBusy}
+                  onClick={() => {
+                    setInspectedImport(null);
+                    setActiveBackupPanel('none');
+                  }}
+                  className="px-3.5 py-2 rounded-xl bg-white/8 hover:bg-white/14 text-xs text-white/80 cursor-pointer"
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  disabled={backupBusy || !hasAnyImportSelected}
+                  onClick={handleConfirmImportBackup}
+                  className="px-4 py-2 rounded-xl text-xs font-semibold text-white flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                  style={{
+                    background: `linear-gradient(135deg, ${activePalette.primary}, ${activePalette.secondary})`,
+                  }}
+                >
+                  <Upload className="w-3.5 h-3.5" />
+                  <span>确认导入并自动保存</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Deferred / Pending MV Timelines waiting for MV video upload */}
+        {pendingMvTimelines.length > 0 && (
+          <div className="rounded-2xl bg-white/[0.04] border border-white/12 p-4 space-y-3">
+            <div className="flex items-center justify-between gap-3 flex-wrap">
+              <div className="flex items-center gap-2">
+                <Clock className="w-4 h-4" style={{ color: activePalette.primary }} />
+                <div>
+                  <p className="text-xs font-semibold text-white">
+                    已暂存 {pendingMvTimelines.length} 条待匹配 MV 前瞻 / 后端时间预设
+                  </p>
+                  <p className="text-[11px] text-white/55">
+                    当您在 MV 剧场中导入对应视频时，将自动对应并恢复前瞻时间与后段尾声时间
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowPendingMvList((v) => !v)}
+                className="px-3 py-1.5 rounded-lg bg-white/10 hover:bg-white/16 text-xs text-white flex items-center gap-1 cursor-pointer"
+              >
+                <span>{showPendingMvList ? '收起列表' : '查看待匹配预设'}</span>
+                {showPendingMvList ? (
+                  <ChevronUp className="w-3.5 h-3.5" />
+                ) : (
+                  <ChevronDown className="w-3.5 h-3.5" />
+                )}
+              </button>
+            </div>
+
+            {showPendingMvList && (
+              <div className="space-y-2 max-h-60 overflow-y-auto lumina-scroll pr-1">
+                {pendingMvTimelines.map((p) => (
+                  <div
+                    key={p.id}
+                    className="flex items-center justify-between gap-3 p-3 rounded-xl bg-black/25 border border-white/10"
+                  >
+                    <div className="min-w-0">
+                      <p className="text-xs font-medium text-white truncate">
+                        {p.mvTitle || p.fileName || 'MV 预设'}
+                        {p.trackTitle ? ` · 对应歌曲「${p.trackTitle}」` : ''}
+                      </p>
+                      <p className="text-[11px] text-white/60 mt-0.5 font-mono-tabular">
+                        前瞻：{p.timeline.introEnabled ? `${p.timeline.introEndSec}s` : '关闭'}
+                        {' · '}
+                        后段：
+                        {p.timeline.outroEnabled
+                          ? p.timeline.outroEndSec
+                            ? `${p.timeline.outroEndSec}s`
+                            : '至视频末尾'
+                          : '关闭'}
+                        {p.timeline.midBreaks?.length
+                          ? ` · 间奏断点 ${p.timeline.midBreaks.length} 处`
+                          : ''}
+                        {p.fileName ? ` · 文件：${p.fileName}` : ''}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => removePendingMvTimeline(p.id)}
+                      className="p-1.5 rounded-lg bg-rose-500/15 hover:bg-rose-500/30 text-rose-200 cursor-pointer shrink-0"
+                      title="删除此暂存预设"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
       </section>
     </div>
   );

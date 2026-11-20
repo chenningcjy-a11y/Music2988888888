@@ -335,6 +335,13 @@ export const MvStandalonePage: React.FC = () => {
   const handleManualFilePick = (files: FileList | null) => {
     if (!files || files.length === 0) return;
     const file = files[0];
+    const isLikelyVideo =
+      file.type.startsWith('video/') ||
+      /\.(mp4|webm|mov|m4v|mkv|avi|flv|3gp|ts|ogv)$/i.test(file.name);
+    if (!isLikelyVideo) {
+      if (fileInputRef.current) fileInputRef.current.value = '';
+      return;
+    }
     manualOverrideRef.current = true;
     const url = URL.createObjectURL(file);
     setManagedVideoUrl(url, true);
@@ -425,7 +432,6 @@ export const MvStandalonePage: React.FC = () => {
       <input
         ref={fileInputRef}
         type="file"
-        accept="video/mp4,video/webm,video/quicktime,video/x-m4v,.mp4,.webm,.mov,.m4v"
         className="hidden"
         onChange={(e) => handleManualFilePick(e.target.files)}
       />
