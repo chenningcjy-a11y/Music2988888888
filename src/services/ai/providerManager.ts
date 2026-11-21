@@ -65,6 +65,7 @@ export async function fetchProviders(): Promise<{
   defaultProviderId: string | null;
   providers: AiProviderConfig[];
   builtinGeminiAvailable?: boolean;
+  builtinGeminiModels?: string[];
   securityMode: string;
 }> {
   const res = await fetch('/api/ai/providers');

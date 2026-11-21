@@ -22,13 +22,17 @@ import { useTaskCenter } from '../context/TaskCenterContext';
 import {
   BackupLocalInventory,
   DEFAULT_BACKUP_EXPORT_OPTIONS,
-  exportLuminaBackupBlob,
+  ExportedBackupVolume,
+  exportLuminaBackup,
+  ExportVolumeMode,
+  FileSystemFileHandleLike,
   getBackupLocalInventory,
-  importLuminaBackup,
-  InspectedBackupFile,
-  inspectLuminaBackupFile,
+  importLuminaBackupFiles,
+  InspectedBackupBatch,
+  inspectLuminaBackupFiles,
   LIGHTWEIGHT_BACKUP_OPTIONS,
   MV_TIMELINE_ONLY_BACKUP_OPTIONS,
+  SAFE_BROWSER_VOLUME_BYTES,
 } from '../services/backupService';
 import { getStorageEstimate } from '../services/storage';
 import {
@@ -149,13 +153,35 @@ export const SettingsPage: React.FC = () => {
   const [exportOptions, setExportOptions] = useState<BackupSelectionOptions>({
     ...DEFAULT_BACKUP_EXPORT_OPTIONS,
   });
-  const [inspectedImport, setInspectedImport] = useState<InspectedBackupFile | null>(null);
+  const [exportVolumeMode, setExportVolumeMode] = useState<ExportVolumeMode>('auto');
+  const [readyVolumes, setReadyVolumes] = useState<
+    Array<ExportedBackupVolume & { downloaded: boolean }>
+  >([]);
+  const [inspectedBatch, setInspectedBatch] = useState<InspectedBackupBatch | null>(null);
   const [importOptions, setImportOptions] = useState<BackupSelectionOptions>({
     ...DEFAULT_BACKUP_EXPORT_OPTIONS,
   });
   const [importMode, setImportMode] = useState<'merge' | 'replace'>('merge');
   const [showPendingMvList, setShowPendingMvList] = useState(false);
   const importInputRef = useRef<HTMLInputElement | null>(null);
+  const activeExportUrlsRef = useRef<string[]>([]);
+
+  const revokeActiveExportUrls = useCallback(() => {
+    for (const url of activeExportUrlsRef.current) {
+      try {
+        URL.revokeObjectURL(url);
+      } catch {
+        // ignore
+      }
+    }
+    activeExportUrlsRef.current = [];
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      revokeActiveExportUrls();
+    };
+  }, [revokeActiveExportUrls]);
 
   const refreshStorage = useCallback(async () => {
     const [est, inv] = await Promise.all([
@@ -176,9 +202,16 @@ export const SettingsPage: React.FC = () => {
     if (exportOptions.includeTrackAudio) total += inventory.tracksAudioBytes;
     if (exportOptions.includeMvVideos) total += inventory.mvVideosBytes;
     if (exportOptions.includeStems) total += inventory.stemsBytes;
-    // Base64 overhead (~1.34x binary) + metadata ~150KB
-    return Math.round(total * 1.34) + 150 * 1024;
+    // >= 20 MiB uses zero-copy .lumina binary archive (1.0x size, NO +34% Base64 overhead)
+    if (total >= 20 * 1024 * 1024) {
+      return total + 256 * 1024;
+    }
+    return Math.round(total * 1.34) + 120 * 1024;
   }, [inventory, exportOptions]);
+
+  const supportsFileSystemPicker =
+    typeof window !== 'undefined' &&
+    typeof (window as Window & { showSaveFilePicker?: unknown }).showSaveFilePicker === 'function';
 
   const hasAnyExportSelected = useMemo(
     () => Object.values(exportOptions).some(Boolean),
@@ -190,30 +223,127 @@ export const SettingsPage: React.FC = () => {
     [importOptions]
   );
 
+  const triggerDownloadVolume = useCallback(
+    (vol: ExportedBackupVolume) => {
+      if (!vol.blob) return;
+      const url = URL.createObjectURL(vol.blob);
+      activeExportUrlsRef.current.push(url);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = vol.filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setReadyVolumes((prev) =>
+        prev.map((item) =>
+          item.index === vol.index ? { ...item, downloaded: true } : item
+        )
+      );
+    },
+    []
+  );
+
   const handleConfirmExportBackup = async () => {
     if (!hasAnyExportSelected) {
       showToast('请至少勾选一项要导出的数据');
       return;
     }
+
+    // Call showSaveFilePicker synchronously inside the click gesture before any IndexedDB awaits!
+    let pickedHandle: FileSystemFileHandleLike | null = null;
+    let effectiveMode: ExportVolumeMode = exportVolumeMode;
+    if (exportVolumeMode === 'single-stream' && supportsFileSystemPicker) {
+      try {
+        const stamp = new Date().toISOString().slice(0, 10);
+        const pickerFn = (
+          window as unknown as {
+            showSaveFilePicker: (opts?: unknown) => Promise<FileSystemFileHandleLike>;
+          }
+        ).showSaveFilePicker;
+        pickedHandle = await pickerFn({
+          suggestedName: `lumina-music-backup-${stamp}.lumina`,
+          types: [
+            {
+              description: 'Lumina Music Backup Archive',
+              accept: { 'application/octet-stream': ['.lumina'] },
+            },
+          ],
+        });
+      } catch (err) {
+        if (err instanceof DOMException && err.name === 'AbortError') {
+          return; // User closed file picker
+        }
+        // Inside cross-origin iframe / mobile WebView -> seamlessly fall back to safe sharded export
+        pickedHandle = null;
+        effectiveMode = 'sharded';
+        showToast('当前环境限制直接写入磁盘，已自动切换为安全分卷零拷贝导出');
+      }
+    }
+
+    revokeActiveExportUrls();
+    setReadyVolumes([]);
     setBackupBusy(true);
     setBackupNotice(null);
-    setBackupProgress('正在初始化流式导出...');
+    setBackupProgress('正在初始化零拷贝流式打包...');
     try {
-      const { blob, filename, manifest } = await exportLuminaBackupBlob(
+      const result = await exportLuminaBackup(
         exportOptions,
+        {
+          mode: effectiveMode,
+          maxVolumeBytes: SAFE_BROWSER_VOLUME_BYTES,
+          diskFileHandle: pickedHandle,
+        },
         (msg) => setBackupProgress(msg)
       );
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      window.setTimeout(() => URL.revokeObjectURL(url), 6000);
-      const msg = `已导出数据包（${formatFileSize(blob.size)}）：${manifest.tracksMetaCount} 首曲目信息（含 ${manifest.tracksAudioCount} 份音频）、${manifest.playlistsCount} 个歌单、${manifest.mvTimelinesCount} 条 MV 时间轴配置（含 ${manifest.mvVideosCount} 个视频）、${manifest.stemsCount} 组分离音轨、${manifest.aiTasksCount} 条 AI 任务记录（不含 API 密钥）`;
-      setBackupNotice(msg);
-      showToast('数据已成功导出');
+
+      if (result.usedFileSystemStream) {
+        const msg = `已通过流式通道完整直写到本地文件（${formatFileSize(
+          result.totalBytes
+        )}）：${result.manifest.tracksMetaCount} 首曲目（含 ${
+          result.manifest.tracksAudioCount
+        } 份音频）、${result.manifest.mvTimelinesCount} 条 MV 配置（含 ${
+          result.manifest.mvVideosCount
+        } 个视频）、${result.manifest.stemsCount} 组分离音轨。`;
+        setBackupNotice(msg);
+        showToast('单文件流式导出完成');
+        return;
+      }
+
+      const itemsWithState = result.volumes.map((v) => ({
+        ...v,
+        downloaded: false,
+      }));
+      setReadyVolumes(itemsWithState);
+
+      if (result.volumes.length === 1 && result.volumes[0].blob) {
+        const single = result.volumes[0];
+        triggerDownloadVolume(single);
+        const msg = `已导出数据包（${formatFileSize(
+          result.totalBytes
+        )} · ${
+          result.formatUsed === 'lumina-binary' ? '.lumina 零拷贝档案' : '.json 轻量包'
+        }）：${result.manifest.tracksMetaCount} 首曲目（含 ${
+          result.manifest.tracksAudioCount
+        } 份音频）、${result.manifest.playlistsCount} 个歌单、${
+          result.manifest.mvTimelinesCount
+        } 条 MV 配置（含 ${result.manifest.mvVideosCount} 个视频）、${
+          result.manifest.stemsCount
+        } 组分离音轨。`;
+        setBackupNotice(msg);
+        showToast('数据已成功导出');
+      } else {
+        // Trigger part 1 automatically; remaining parts appear as instant click cards (avoids Chrome multi-download blocking & memory spikes)
+        if (result.volumes[0]?.blob) {
+          triggerDownloadVolume(result.volumes[0]);
+        }
+        const msg = `为防止浏览器在导出 ${formatFileSize(
+          result.totalBytes
+        )} 大数据时内存崩溃，已安全拆分为 ${
+          result.volumes.length
+        } 个零拷贝分卷（每卷约 ≤350 MB）。第 1 卷已开始下载，请在下方依次点击保存其余分卷；导入时多选全部 .lumina 分卷即可一键自动还原。`;
+        setBackupNotice(msg);
+        showToast(`已生成 ${result.volumes.length} 个安全分卷，请依次下载`);
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : '导出备份失败';
       setBackupNotice(msg);
@@ -224,18 +354,18 @@ export const SettingsPage: React.FC = () => {
     }
   };
 
-  const handleSelectImportFile = async (
+  const handleSelectImportFiles = async (
     e: React.ChangeEvent<HTMLInputElement>
   ) => {
-    const file = e.target.files?.[0];
+    const fileList = e.target.files ? Array.from(e.target.files) : [];
     e.target.value = '';
-    if (!file) return;
+    if (fileList.length === 0) return;
     setBackupBusy(true);
     setBackupNotice(null);
-    setBackupProgress('正在扫描备份文件内容...');
+    setBackupProgress(`正在读取 ${fileList.length} 个备份文件清单...`);
     try {
-      const inspected = await inspectLuminaBackupFile(file);
-      setInspectedImport(inspected);
+      const inspected = await inspectLuminaBackupFiles(fileList);
+      setInspectedBatch(inspected);
       setImportOptions({ ...inspected.availableOptions });
       setActiveBackupPanel('import');
     } catch (err) {
@@ -249,17 +379,17 @@ export const SettingsPage: React.FC = () => {
   };
 
   const handleConfirmImportBackup = async () => {
-    if (!inspectedImport) return;
+    if (!inspectedBatch) return;
     if (!hasAnyImportSelected) {
       showToast('请至少勾选一项要导入的数据');
       return;
     }
     setBackupBusy(true);
     setBackupNotice(null);
-    setBackupProgress('正在导入并自动保存...');
+    setBackupProgress('正在零拷贝导入并自动保存...');
     try {
-      const summary = await importLuminaBackup(
-        inspectedImport.file,
+      const summary = await importLuminaBackupFiles(
+        inspectedBatch,
         importOptions,
         importMode,
         (msg) => setBackupProgress(msg)
@@ -320,7 +450,7 @@ export const SettingsPage: React.FC = () => {
           ? `已自动保存并恢复：${parts.join('、')}。`
           : '所选数据类别在备份文件中均为空，已完成检查。';
       setBackupNotice(msg);
-      setInspectedImport(null);
+      setInspectedBatch(null);
       setActiveBackupPanel('none');
       showToast('导入完成并已自动保存');
     } catch (err) {
@@ -685,9 +815,9 @@ export const SettingsPage: React.FC = () => {
           <input
             ref={importInputRef}
             type="file"
-            accept=".json,application/json"
+            multiple
             className="hidden"
-            onChange={handleSelectImportFile}
+            onChange={handleSelectImportFiles}
           />
           <button
             type="button"
@@ -700,7 +830,7 @@ export const SettingsPage: React.FC = () => {
             }`}
           >
             <Upload className="w-4 h-4" />
-            <span>导入数据 (可选与自动保存)</span>
+            <span>导入数据 (支持 .lumina 分卷 / .json)</span>
           </button>
 
           <button
@@ -716,7 +846,7 @@ export const SettingsPage: React.FC = () => {
             }`}
           >
             <Download className="w-4 h-4" />
-            <span>选择数据导出 (JSON)</span>
+            <span>选择数据导出 (.lumina / JSON)</span>
             {activeBackupPanel === 'export' ? (
               <ChevronUp className="w-3.5 h-3.5 opacity-80" />
             ) : (
@@ -887,12 +1017,109 @@ export const SettingsPage: React.FC = () => {
               ))}
             </div>
 
+            {/* Multi-volume Download List when backup was safely sharded */}
+            {readyVolumes.length > 1 && (
+              <div className="rounded-xl bg-white/[0.05] border border-white/15 p-3.5 space-y-2.5">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-semibold text-white">
+                    安全分卷导出列表（共 {readyVolumes.length} 个分卷 · 零拷贝防崩溃）
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      revokeActiveExportUrls();
+                      setReadyVolumes([]);
+                    }}
+                    className="text-[11px] text-white/60 hover:text-white cursor-pointer"
+                  >
+                    清除列表
+                  </button>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  {readyVolumes.map((vol) => (
+                    <div
+                      key={vol.index}
+                      className="flex items-center justify-between gap-2.5 p-2.5 rounded-lg bg-black/30 border border-white/10"
+                    >
+                      <div className="min-w-0">
+                        <p className="text-xs font-medium text-white truncate">
+                          分卷 {vol.index}/{vol.total} · {formatFileSize(vol.sizeBytes)}
+                        </p>
+                        <p className="text-[11px] text-white/55 truncate">
+                          {vol.summary}
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => triggerDownloadVolume(vol)}
+                        className={`px-3 py-1.5 rounded-lg text-[11px] font-medium shrink-0 cursor-pointer ${
+                          vol.downloaded
+                            ? 'bg-emerald-500/20 border border-emerald-400/35 text-emerald-100'
+                            : 'bg-white/15 hover:bg-white/25 text-white'
+                        }`}
+                      >
+                        {vol.downloaded ? '再次下载' : '点击下载'}
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Large-data export transport mode */}
+            {estimatedExportBytes >= 20 * 1024 * 1024 && (
+              <div className="rounded-xl bg-white/[0.04] border border-white/10 p-3 space-y-2">
+                <span className="text-[11px] font-medium text-white/80 block">
+                  大体积导出模式（≥20 MB 自动采用 .lumina 零拷贝容器，不经过 Base64 膨胀与 JS 堆复制）
+                </span>
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setExportVolumeMode('auto')}
+                    className={`px-3 py-1.5 rounded-lg text-[11px] border cursor-pointer ${
+                      exportVolumeMode === 'auto' || exportVolumeMode === 'sharded'
+                        ? 'bg-white/20 border-white/35 text-white'
+                        : 'bg-white/5 border-white/10 text-white/65 hover:text-white'
+                    }`}
+                  >
+                    自动安全分卷 (每卷 ≤350 MB · 手机/平板 2GB+ 推荐)
+                  </button>
+                  {supportsFileSystemPicker && (
+                    <button
+                      type="button"
+                      onClick={() => setExportVolumeMode('single-stream')}
+                      className={`px-3 py-1.5 rounded-lg text-[11px] border cursor-pointer ${
+                        exportVolumeMode === 'single-stream'
+                          ? 'bg-white/20 border-white/35 text-white'
+                          : 'bg-white/5 border-white/10 text-white/65 hover:text-white'
+                      }`}
+                    >
+                      桌面单文件直写磁盘 (8MB 流式直写)
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setExportVolumeMode('single-blob')}
+                    className={`px-3 py-1.5 rounded-lg text-[11px] border cursor-pointer ${
+                      exportVolumeMode === 'single-blob'
+                        ? 'bg-white/20 border-white/35 text-white'
+                        : 'bg-white/5 border-white/10 text-white/65 hover:text-white'
+                    }`}
+                  >
+                    合并单文件下载
+                  </button>
+                </div>
+              </div>
+            )}
+
             <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-white/10">
               <span className="text-xs text-white/65 font-mono-tabular">
                 预计导出体积：约 {formatFileSize(estimatedExportBytes)}
-                {estimatedExportBytes > 180 * 1024 * 1024
-                  ? '（体积较大，已自动启用分块流式打包）'
-                  : ''}
+                {estimatedExportBytes > SAFE_BROWSER_VOLUME_BYTES
+                  ? '（2GB 级媒体将自动零拷贝分卷打包，绝不内存崩溃）'
+                  : estimatedExportBytes >= 20 * 1024 * 1024
+                  ? '（.lumina 零拷贝无损打包）'
+                  : '（轻量 .json 文件）'}
               </span>
               <div className="flex items-center gap-2">
                 <button
@@ -920,8 +1147,55 @@ export const SettingsPage: React.FC = () => {
           </div>
         )}
 
+        {/* Sharded volumes download panel even after closing export drawer */}
+        {activeBackupPanel !== 'export' && readyVolumes.length > 1 && (
+          <div className="rounded-2xl bg-black/30 border border-white/15 p-4 space-y-2.5">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-xs font-semibold text-white">
+                待下载导出分卷（共 {readyVolumes.length} 卷）
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  revokeActiveExportUrls();
+                  setReadyVolumes([]);
+                }}
+                className="text-[11px] text-white/60 hover:text-white cursor-pointer"
+              >
+                完成并关闭
+              </button>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              {readyVolumes.map((vol) => (
+                <div
+                  key={vol.index}
+                  className="flex items-center justify-between gap-2.5 p-2.5 rounded-lg bg-white/[0.04] border border-white/10"
+                >
+                  <div className="min-w-0">
+                    <p className="text-xs font-medium text-white truncate">
+                      分卷 {vol.index}/{vol.total} · {formatFileSize(vol.sizeBytes)}
+                    </p>
+                    <p className="text-[11px] text-white/55 truncate">{vol.summary}</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => triggerDownloadVolume(vol)}
+                    className={`px-3 py-1.5 rounded-lg text-[11px] font-medium shrink-0 cursor-pointer ${
+                      vol.downloaded
+                        ? 'bg-emerald-500/20 border border-emerald-400/35 text-emerald-100'
+                        : 'bg-white/15 hover:bg-white/25 text-white'
+                    }`}
+                  >
+                    {vol.downloaded ? '再次下载' : '点击下载'}
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
         {/* Selectable Import Options & Auto-Save Confirmation Drawer */}
-        {activeBackupPanel === 'import' && inspectedImport && (
+        {activeBackupPanel === 'import' && inspectedBatch && (
           <div className="rounded-2xl bg-black/30 border border-white/15 p-4 sm:p-5 space-y-4">
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div>
@@ -929,9 +1203,12 @@ export const SettingsPage: React.FC = () => {
                   选择要导入并自动保存的数据项
                 </h3>
                 <p className="text-xs text-white/60 mt-0.5">
-                  文件：{inspectedImport.fileName}（{formatFileSize(inspectedImport.fileSizeBytes)}）
-                  {inspectedImport.exportedAt
-                    ? ` · 导出时间：${new Date(inspectedImport.exportedAt).toLocaleString()}`
+                  {inspectedBatch.items.length === 1
+                    ? `文件：${inspectedBatch.items[0].fileName}`
+                    : `已批量选中 ${inspectedBatch.items.length} 个分卷文件`}
+                  （共 {formatFileSize(inspectedBatch.totalSizeBytes)}）
+                  {inspectedBatch.exportedAt
+                    ? ` · 导出时间：${new Date(inspectedBatch.exportedAt).toLocaleString()}`
                     : ''}
                 </p>
               </div>
@@ -962,66 +1239,72 @@ export const SettingsPage: React.FC = () => {
               </div>
             </div>
 
+            {inspectedBatch.missingSplitChunksWarning && (
+              <div className="rounded-xl bg-amber-500/15 border border-amber-400/35 px-3.5 py-2.5 text-xs text-amber-100 leading-relaxed">
+                {inspectedBatch.missingSplitChunksWarning}
+              </div>
+            )}
+
             <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
               {(
                 [
                   {
                     key: 'includeTracksMeta',
-                    available: inspectedImport.availableOptions.includeTracksMeta,
+                    available: inspectedBatch.availableOptions.includeTracksMeta,
                     title: '增加的歌曲信息与歌词调整',
-                    desc: `包内含 ${inspectedImport.manifest.tracksMetaCount} 首曲目、封面、收藏与歌词/时间偏移`,
+                    desc: `包内含 ${inspectedBatch.manifest.tracksMetaCount} 首曲目、封面、收藏与歌词/时间偏移`,
                   },
                   {
                     key: 'includeTrackAudio',
-                    available: inspectedImport.availableOptions.includeTrackAudio,
+                    available: inspectedBatch.availableOptions.includeTrackAudio,
                     title: '歌曲音频文件本体',
-                    desc: `包内含 ${inspectedImport.manifest.tracksAudioCount} 份音频文件（导入即自动保存到本地曲库）`,
+                    desc: `包内含 ${inspectedBatch.manifest.tracksAudioCount} 份音频文件（导入即自动保存到本地曲库）`,
                   },
                   {
                     key: 'includePlaylists',
-                    available: inspectedImport.availableOptions.includePlaylists,
+                    available: inspectedBatch.availableOptions.includePlaylists,
                     title: '增加的播放列表与歌单排序',
-                    desc: `包内含 ${inspectedImport.manifest.playlistsCount} 个歌单`,
+                    desc: `包内含 ${inspectedBatch.manifest.playlistsCount} 个歌单`,
                   },
                   {
                     key: 'includeMvTimelines',
-                    available: inspectedImport.availableOptions.includeMvTimelines,
+                    available: inspectedBatch.availableOptions.includeMvTimelines,
                     title: 'MV 前瞻时间、后段时间与视效调整',
-                    desc: `包内含 ${inspectedImport.manifest.mvTimelinesCount} 条（若对应 MV 尚未导入，将自动暂存并在日后导入该 MV 时自动匹配）`,
+                    desc: `包内含 ${inspectedBatch.manifest.mvTimelinesCount} 条（若对应 MV 尚未导入，将自动暂存并在日后导入该 MV 时自动匹配）`,
                   },
                   {
                     key: 'includeMvVideos',
-                    available: inspectedImport.availableOptions.includeMvVideos,
+                    available: inspectedBatch.availableOptions.includeMvVideos,
                     title: 'MV 本地视频文件本体',
-                    desc: `包内含 ${inspectedImport.manifest.mvVideosCount} 个 MV 视频文件`,
+                    desc: `包内含 ${inspectedBatch.manifest.mvVideosCount} 个 MV 视频文件`,
                   },
                   {
                     key: 'includeStems',
-                    available: inspectedImport.availableOptions.includeStems,
+                    available: inspectedBatch.availableOptions.includeStems,
                     title: 'AI 分离人声与伴奏缓存音轨',
-                    desc: `包内含 ${inspectedImport.manifest.stemsCount} 组分离音轨`,
+                    desc: `包内含 ${inspectedBatch.manifest.stemsCount} 组分离音轨`,
                   },
                   {
                     key: 'includeAudioSettings',
-                    available: inspectedImport.availableOptions.includeAudioSettings,
+                    available: inspectedBatch.availableOptions.includeAudioSettings,
                     title: '调整过的音质与 DSP 音效参数',
-                    desc: inspectedImport.manifest.hasAudioSettings
+                    desc: inspectedBatch.manifest.hasAudioSettings
                       ? '包含 7 段均衡器 EQ、环绕声、混响、人声/伴奏平衡等调整'
                       : '此备份包未包含音质参数',
                   },
                   {
                     key: 'includePersonalization',
-                    available: inspectedImport.availableOptions.includePersonalization,
+                    available: inspectedBatch.availableOptions.includePersonalization,
                     title: '调整过的个性化外观与播放偏好',
-                    desc: inspectedImport.manifest.hasPersonalization
+                    desc: inspectedBatch.manifest.hasPersonalization
                       ? '包含主题流彩、字体、光效波浪、MV UI 淡入淡出时长与播放偏好'
                       : '此备份包未包含个性化偏好',
                   },
                   {
                     key: 'includeAiData',
-                    available: inspectedImport.availableOptions.includeAiData,
+                    available: inspectedBatch.availableOptions.includeAiData,
                     title: 'AI 服务商配置与任务记录',
-                    desc: `包含 ${inspectedImport.manifest.aiProvidersCount} 个 AI 服务配置、${inspectedImport.manifest.aiTasksCount} 条任务记录（保留本机已有密钥）`,
+                    desc: `包含 ${inspectedBatch.manifest.aiProvidersCount} 个 AI 服务配置、${inspectedBatch.manifest.aiTasksCount} 条任务记录（保留本机已有密钥）`,
                   },
                 ] as {
                   key: keyof BackupSelectionOptions;
@@ -1071,7 +1354,7 @@ export const SettingsPage: React.FC = () => {
                   type="button"
                   disabled={backupBusy}
                   onClick={() => {
-                    setInspectedImport(null);
+                    setInspectedBatch(null);
                     setActiveBackupPanel('none');
                   }}
                   className="px-3.5 py-2 rounded-xl bg-white/8 hover:bg-white/14 text-xs text-white/80 cursor-pointer"

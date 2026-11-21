@@ -309,6 +309,19 @@ export async function getStorageEstimate(): Promise<{
   return { usageBytes: 0, quotaBytes: 0 };
 }
 
+export async function requestPersistentStorage(): Promise<boolean> {
+  try {
+    if (navigator.storage && typeof navigator.storage.persist === 'function') {
+      const persisted = await navigator.storage.persisted?.();
+      if (persisted) return true;
+      return await navigator.storage.persist();
+    }
+  } catch {
+    // Non-fatal
+  }
+  return false;
+}
+
 export async function clearAllMusicData(): Promise<void> {
   const db = await openDatabase();
   return new Promise((resolve, reject) => {
@@ -490,6 +503,29 @@ export async function getMvRecordById(
       | undefined;
     if (!rec) return undefined;
     return hydrateMvRecord(db, rec);
+  } catch {
+    return undefined;
+  }
+}
+
+export async function getMvBlobById(mvId: string): Promise<Blob | undefined> {
+  try {
+    const db = await openDatabase();
+    const txBlob = db.transaction(STORE_MV_BLOBS, 'readonly');
+    const blob = (await wrapRequest(
+      txBlob.objectStore(STORE_MV_BLOBS).get(mvId)
+    )) as Blob | undefined;
+    if (blob && blob.size > 0) return blob;
+
+    // Legacy fallback if an older MV stored videoBlob inline inside STORE_MVS
+    const txMeta = db.transaction(STORE_MVS, 'readonly');
+    const rec = (await wrapRequest(txMeta.objectStore(STORE_MVS).get(mvId))) as
+      | TrackMvRecord
+      | undefined;
+    if (rec?.videoBlob && rec.videoBlob.size > 0) {
+      return rec.videoBlob;
+    }
+    return undefined;
   } catch {
     return undefined;
   }

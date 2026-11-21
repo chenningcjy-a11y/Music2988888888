@@ -11,6 +11,8 @@ export const QueueDrawer: React.FC = () => {
     tracks,
     currentTrack,
     isPlaying,
+    shuffle,
+    shufflePlayedIds,
     playTrackById,
     removeFromQueue,
     clearQueue,
@@ -23,6 +25,11 @@ export const QueueDrawer: React.FC = () => {
     .map((id) => tracks.find((t) => t.id === id))
     .filter((t): t is NonNullable<typeof t> => Boolean(t));
 
+  const shufflePlayedSet = new Set(shufflePlayedIds);
+  const playedInCycleCount = queuedTracks.filter((t) =>
+    shufflePlayedSet.has(t.id)
+  ).length;
+
   return (
     <div className="fixed inset-0 z-50 flex justify-end">
       <div
@@ -31,11 +38,14 @@ export const QueueDrawer: React.FC = () => {
       />
       <aside className="relative z-10 w-full max-w-md h-full bg-[#1a0710]/90 backdrop-blur-2xl border-l border-white/12 flex flex-col shadow-2xl">
         <div className="flex items-center justify-between px-5 py-4 border-b border-white/10">
-          <div className="flex items-center gap-2.5">
-            <ListMusic className="w-5 h-5" style={{ color: activePalette.primary }} />
-            <h2 className="text-base font-semibold text-white">播放队列</h2>
-            <span className="text-xs text-white/50 font-mono-tabular">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <ListMusic className="w-5 h-5 shrink-0" style={{ color: activePalette.primary }} />
+            <h2 className="text-base font-semibold text-white shrink-0">播放队列</h2>
+            <span className="text-xs text-white/50 font-mono-tabular truncate">
               {queuedTracks.length} 首
+              {shuffle && queuedTracks.length > 1
+                ? ` · 本轮随机 ${playedInCycleCount}/${queuedTracks.length}`
+                : ''}
             </span>
           </div>
           <div className="flex items-center gap-2">
@@ -67,12 +77,16 @@ export const QueueDrawer: React.FC = () => {
           ) : (
             queuedTracks.map((track, idx) => {
               const active = currentTrack?.id === track.id;
+              const alreadyPlayedInShuffle =
+                shuffle && !active && shufflePlayedSet.has(track.id);
               return (
                 <div
                   key={`${track.id}-${idx}`}
                   className={`flex items-center gap-3 p-2.5 rounded-xl transition-colors group ${
                     active
                       ? 'bg-white/12 border border-white/15'
+                      : alreadyPlayedInShuffle
+                      ? 'opacity-60 hover:opacity-100 hover:bg-white/[0.06]'
                       : 'hover:bg-white/[0.06]'
                   }`}
                 >
@@ -114,6 +128,7 @@ export const QueueDrawer: React.FC = () => {
                     </p>
                     <p className="text-xs text-white/55 truncate mt-0.5">
                       {track.artist} · <span className="font-mono-tabular">{formatTime(track.duration)}</span>
+                      {alreadyPlayedInShuffle ? ' · 本轮已随机' : ''}
                     </p>
                   </button>
 

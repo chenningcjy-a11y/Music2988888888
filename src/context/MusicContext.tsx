@@ -31,6 +31,7 @@ import {
   markDemoInitialized,
   matchAndConsumePendingMvTimeline,
   removePendingMvTimelineById,
+  requestPersistentStorage,
   saveAudioSettings,
   savePersonalization,
   savePlaybackPrefs,
@@ -123,6 +124,7 @@ interface MusicContextValue {
   volume: number;
   muted: boolean;
   shuffle: boolean;
+  shufflePlayedIds: string[];
   repeat: RepeatMode;
   isQueueOpen: boolean;
   setIsQueueOpen: (open: boolean) => void;
@@ -159,6 +161,10 @@ interface MusicContextValue {
   importLocalFiles: (files: FileList | File[]) => Promise<void>;
   toggleFavorite: (id: string) => Promise<void>;
   deleteTrack: (id: string) => Promise<void>;
+  updateTrackInfo: (
+    id: string,
+    patch: { title: string; artist: string; album?: string }
+  ) => Promise<void>;
   updateTrackCover: (id: string, imageFile: File) => Promise<void>;
   updateTrackLyrics: (id: string, lyricsRaw: string) => Promise<void>;
   translateTrackLyrics: (
@@ -246,6 +252,7 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
   const [volume, setVolumeState] = useState(0.85);
   const [muted, setMuted] = useState(false);
   const [shuffle, setShuffle] = useState(false);
+  const [shufflePlayedIds, setShufflePlayedIds] = useState<string[]>([]);
   const [repeat, setRepeat] = useState<RepeatMode>('all');
 
   const [isQueueOpen, setIsQueueOpen] = useState(false);
@@ -296,6 +303,12 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
   const outroStartMvSecRef = useRef<number>(0);
   const allowIntroTailCrossfadeRef = useRef<boolean>(true);
   const lastLiveSnapAtRef = useRef<number>(0);
+  const shufflePlayedIdsRef = useRef<Set<string>>(new Set());
+  const shuffleHistoryRef = useRef<string[]>([]);
+
+  const syncShufflePlayedState = useCallback(() => {
+    setShufflePlayedIds(Array.from(shufflePlayedIdsRef.current));
+  }, []);
 
   mvPhaseRef.current = mvPhase;
   activeMidBreakRef.current = activeMidBreak;
@@ -478,7 +491,11 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
   );
 
   const playTrackById = useCallback(
-    async (id: string, customQueue?: string[]) => {
+    async (
+      id: string,
+      customQueue?: string[],
+      internalOpts?: { fromShuffleCycle?: boolean }
+    ) => {
       const target = stateRef.current.tracks.find((t) => t.id === id);
       if (!target) return;
 
@@ -486,8 +503,25 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
 
       if (customQueue) {
         setQueueIds(customQueue);
-      } else if (!stateRef.current.queueIds.includes(id)) {
-        setQueueIds((prev) => (prev.length > 0 ? [...prev, id] : [id]));
+        // New explicit queue starts a fresh shuffle cycle starting from this track
+        shufflePlayedIdsRef.current = new Set([id]);
+        shuffleHistoryRef.current = [id];
+        syncShufflePlayedState();
+      } else {
+        if (!stateRef.current.queueIds.includes(id)) {
+          setQueueIds((prev) => (prev.length > 0 ? [...prev, id] : [id]));
+        }
+        if (!internalOpts?.fromShuffleCycle && stateRef.current.shuffle) {
+          shufflePlayedIdsRef.current.add(id);
+          if (
+            shuffleHistoryRef.current[shuffleHistoryRef.current.length - 1] !== id
+          ) {
+            shuffleHistoryRef.current = [...shuffleHistoryRef.current, id].slice(
+              -200
+            );
+          }
+          syncShufflePlayedState();
+        }
       }
 
       savePlaybackPrefs({
@@ -548,7 +582,7 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
         await loadBlobIntoEngine(target, true);
       }
     },
-    [loadBlobIntoEngine, muted, syncTrackMvsForTrack, volume]
+    [loadBlobIntoEngine, muted, syncShufflePlayedState, syncTrackMvsForTrack, volume]
   );
 
   const playNext = useCallback(
@@ -559,7 +593,7 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
       if (list.length === 0) return;
 
       if (!manual && rep === 'one' && curId) {
-        await playTrackById(curId);
+        await playTrackById(curId, undefined, { fromShuffleCycle: true });
         return;
       }
 
@@ -567,9 +601,57 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
       let nextIdx = 0;
 
       if (shuf && list.length > 1) {
-        const candidates = list.filter((id) => id !== curId);
-        const pick = candidates[Math.floor(Math.random() * candidates.length)];
-        await playTrackById(pick);
+        // Ensure the currently playing track is marked as played in this cycle
+        if (curId && list.includes(curId)) {
+          shufflePlayedIdsRef.current.add(curId);
+        }
+
+        // Remove stale IDs no longer present in the active queue
+        const listSet = new Set(list);
+        for (const pid of Array.from(shufflePlayedIdsRef.current)) {
+          if (!listSet.has(pid)) {
+            shufflePlayedIdsRef.current.delete(pid);
+          }
+        }
+
+        let remaining = list.filter(
+          (id) => !shufflePlayedIdsRef.current.has(id)
+        );
+
+        if (remaining.length === 0) {
+          // Every song in the current queue has been randomly played once
+          if (!manual && rep === 'off') {
+            shufflePlayedIdsRef.current.clear();
+            syncShufflePlayedState();
+            audioEngine.pause();
+            audioEngine.seek(0);
+            setMvPhase('normal');
+            setActiveMidBreak(null);
+            setIsPlaying(false);
+            showToast('本队列全部歌曲已随机播放完毕');
+            return;
+          }
+
+          // Reset for a brand new shuffle round across the full queue
+          // Avoid immediate back-to-back repeat of the last song when starting round N+1
+          shufflePlayedIdsRef.current.clear();
+          remaining = list.filter((id) => id !== curId);
+          if (remaining.length === 0) remaining = list;
+          showToast('本队列全部歌曲已随机完成，已开启新一轮全队列随机');
+        }
+
+        const pick = remaining[Math.floor(Math.random() * remaining.length)];
+        shufflePlayedIdsRef.current.add(pick);
+        if (
+          shuffleHistoryRef.current[shuffleHistoryRef.current.length - 1] !==
+          pick
+        ) {
+          shuffleHistoryRef.current = [...shuffleHistoryRef.current, pick].slice(
+            -200
+          );
+        }
+        syncShufflePlayedState();
+        await playTrackById(pick, undefined, { fromShuffleCycle: true });
         return;
       } else {
         nextIdx = curIdx + 1;
@@ -588,7 +670,7 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
 
       await playTrackById(list[nextIdx]);
     },
-    [playTrackById]
+    [playTrackById, showToast, syncShufflePlayedState]
   );
 
   const playPrev = useCallback(async () => {
@@ -601,13 +683,36 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
     }
     if (mvPhaseRef.current === 'mid-break' || mvPhaseRef.current === 'outro') {
       if (stateRef.current.currentTrackId) {
-        await playTrackById(stateRef.current.currentTrackId);
+        await playTrackById(stateRef.current.currentTrackId, undefined, {
+          fromShuffleCycle: true,
+        });
         return;
       }
     }
-    const { queueIds: q, tracks: all, currentTrackId: curId } = stateRef.current;
+    const { queueIds: q, tracks: all, currentTrackId: curId, shuffle: shuf } =
+      stateRef.current;
     const list = q.length > 0 ? q : all.map((t) => t.id);
     if (list.length === 0) return;
+
+    if (shuf && shuffleHistoryRef.current.length > 1) {
+      const listSet = new Set(list);
+      const nextHist = [...shuffleHistoryRef.current];
+      // Pop current track from history top
+      if (nextHist[nextHist.length - 1] === curId) {
+        nextHist.pop();
+      }
+      while (nextHist.length > 0) {
+        const candidate = nextHist[nextHist.length - 1];
+        if (candidate && candidate !== curId && listSet.has(candidate)) {
+          shuffleHistoryRef.current = nextHist;
+          await playTrackById(candidate, undefined, { fromShuffleCycle: true });
+          return;
+        }
+        nextHist.pop();
+      }
+      shuffleHistoryRef.current = nextHist;
+    }
+
     const curIdx = curId ? list.indexOf(curId) : 0;
     const prevIdx = (curIdx - 1 + list.length) % list.length;
     await playTrackById(list[prevIdx]);
@@ -734,6 +839,11 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
         existingTracks[0];
 
       if (preferred) {
+        if (loadedPrefs.shuffle) {
+          shufflePlayedIdsRef.current = new Set([preferred.id]);
+          shuffleHistoryRef.current = [preferred.id];
+          setShufflePlayedIds([preferred.id]);
+        }
         await loadBlobIntoEngine(preferred, false);
       }
     }
@@ -1133,6 +1243,19 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
   const toggleShuffle = useCallback(() => {
     setShuffle((prev) => {
       const next = !prev;
+      if (next) {
+        shufflePlayedIdsRef.current = new Set(
+          currentTrackId ? [currentTrackId] : []
+        );
+        shuffleHistoryRef.current = currentTrackId ? [currentTrackId] : [];
+        syncShufflePlayedState();
+        showToast('已开启不重复随机：本队列全部歌曲听完前不会重复');
+      } else {
+        shufflePlayedIdsRef.current.clear();
+        shuffleHistoryRef.current = [];
+        syncShufflePlayedState();
+        showToast('已关闭随机播放');
+      }
       savePlaybackPrefs({
         volume,
         muted,
@@ -1142,7 +1265,7 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
       }).catch(() => {});
       return next;
     });
-  }, [volume, muted, repeat, currentTrackId]);
+  }, [volume, muted, repeat, currentTrackId, showToast, syncShufflePlayedState]);
 
   const cycleRepeat = useCallback(() => {
     setRepeat((prev) => {
@@ -1166,13 +1289,27 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
     [showToast]
   );
 
-  const removeFromQueue = useCallback((id: string) => {
-    setQueueIds((prev) => prev.filter((item) => item !== id));
-  }, []);
+  const removeFromQueue = useCallback(
+    (id: string) => {
+      setQueueIds((prev) => prev.filter((item) => item !== id));
+      if (shufflePlayedIdsRef.current.delete(id)) {
+        syncShufflePlayedState();
+      }
+      shuffleHistoryRef.current = shuffleHistoryRef.current.filter(
+        (item) => item !== id
+      );
+    },
+    [syncShufflePlayedState]
+  );
 
   const clearQueue = useCallback(() => {
     setQueueIds(currentTrackId ? [currentTrackId] : []);
-  }, [currentTrackId]);
+    shufflePlayedIdsRef.current = new Set(
+      currentTrackId ? [currentTrackId] : []
+    );
+    shuffleHistoryRef.current = currentTrackId ? [currentTrackId] : [];
+    syncShufflePlayedState();
+  }, [currentTrackId, syncShufflePlayedState]);
 
   const importLocalFiles = useCallback(
     async (fileList: FileList | File[]) => {
@@ -1195,6 +1332,7 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
       const newlyAdded: TrackMetadata[] = [];
 
       try {
+        await requestPersistentStorage();
         const existingTracks = await getAllTracks();
 
         for (let i = 0; i < files.length; i++) {
@@ -1281,6 +1419,12 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
         return copy;
       });
       setQueueIds((prev) => prev.filter((qId) => qId !== id));
+      if (shufflePlayedIdsRef.current.delete(id)) {
+        syncShufflePlayedState();
+      }
+      shuffleHistoryRef.current = shuffleHistoryRef.current.filter(
+        (hId) => hId !== id
+      );
       setPlaylists((prev) =>
         prev.map((pl) => {
           if (!pl.trackIds.includes(id)) return pl;
@@ -1306,6 +1450,30 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
       showToast('已从曲库删除歌曲');
     },
     [currentTrackId, refreshAllMvCounts, showToast]
+  );
+
+  const updateTrackInfo = useCallback(
+    async (
+      id: string,
+      patch: { title: string; artist: string; album?: string }
+    ) => {
+      const target = stateRef.current.tracks.find((t) => t.id === id);
+      if (!target) return;
+      const nextTitle = patch.title.trim() || target.title;
+      const nextArtist = patch.artist.trim() || '未知艺术家';
+      const nextAlbum =
+        patch.album !== undefined ? patch.album.trim() || '本地音乐' : target.album;
+      const updated: TrackMetadata = {
+        ...target,
+        title: nextTitle,
+        artist: nextArtist,
+        album: nextAlbum,
+      };
+      await updateTrackMetadata(updated);
+      setTracks((prev) => prev.map((t) => (t.id === id ? updated : t)));
+      showToast('已更新歌曲名称与人物信息');
+    },
+    [showToast]
   );
 
   const updateTrackCover = useCallback(
@@ -1423,8 +1591,11 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
     setMvPhase('normal');
     setActiveMidBreak(null);
     setQueueIds([]);
+    shufflePlayedIdsRef.current.clear();
+    shuffleHistoryRef.current = [];
+    syncShufflePlayedState();
     showToast('本地曲库、MV 缓存与播放列表已清空');
-  }, [showToast]);
+  }, [showToast, syncShufflePlayedState]);
 
   // Playlist operations
   const createPlaylist = useCallback(
@@ -1655,6 +1826,15 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
     const preferred =
       allTracks.find((t) => t.id === loadedPrefs.lastTrackId) || allTracks[0];
     if (preferred) {
+      if (loadedPrefs.shuffle) {
+        shufflePlayedIdsRef.current = new Set([preferred.id]);
+        shuffleHistoryRef.current = [preferred.id];
+        setShufflePlayedIds([preferred.id]);
+      } else {
+        shufflePlayedIdsRef.current.clear();
+        shuffleHistoryRef.current = [];
+        setShufflePlayedIds([]);
+      }
       await loadBlobIntoEngine(preferred, false);
       await syncTrackMvsForTrack(preferred.id);
     }
@@ -1760,6 +1940,7 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
   // MV CRUD & Skip Controls
   const uploadTrackMvFile = useCallback(
     async (trackId: string, file: File): Promise<TrackMvMeta> => {
+      await requestPersistentStorage();
       const tempUrl = URL.createObjectURL(file);
       let durationSec = 0;
       try {
@@ -2435,6 +2616,7 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
     volume,
     muted,
     shuffle,
+    shufflePlayedIds,
     repeat,
     isQueueOpen,
     setIsQueueOpen,
@@ -2465,6 +2647,7 @@ export const MusicProvider: React.FC<{ children: React.ReactNode }> = ({
     importLocalFiles,
     toggleFavorite,
     deleteTrack,
+    updateTrackInfo,
     updateTrackCover,
     updateTrackLyrics,
     translateTrackLyrics,

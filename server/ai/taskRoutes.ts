@@ -172,6 +172,18 @@ export function createAiRouter(): Router {
       res.json({
         ...data,
         builtinGeminiAvailable: Boolean(process.env.GEMINI_API_KEY),
+        builtinGeminiModels: process.env.GEMINI_API_KEY
+          ? [
+              '__builtin_auto_ensemble__',
+              'gemini-3.1-flash-lite::minimal',
+              'gemini-3.1-flash-lite::medium',
+              'gemini-3.1-flash-lite::high',
+              'gemini-4-hydrogen::low',
+              'gemini-4-hydrogen::medium',
+              'gemini-4-hydrogen::high',
+              'gemini-4-hydrogen::xhigh',
+            ]
+          : [],
         securityMode: 'backend-encrypted-proxy',
       });
     } catch (err) {
@@ -891,7 +903,7 @@ CRITICAL RULES:
     }
   });
 
-  // 7. AI MV Theater Intro / Outro Boundary Analyzer (multimodal frames + acoustic correlation)
+  // 7. AI MV Theater Intro / Mid-Breaks / Outro Boundary Analyzer (full-track acoustic draft + multimodal frames)
   router.post('/tasks/mv-theater-analyze', async (req, res) => {
     try {
       const {
@@ -906,6 +918,8 @@ CRITICAL RULES:
         lastLyricSec = null,
         headCorrelationCandidates = [],
         tailCorrelationCandidates = [],
+        alignmentPlateaus = [],
+        localDraft = null,
         mvSilenceSegments = [],
         mvEnergyTimeline = [],
         songEnergyTimeline = [],
@@ -935,47 +949,16 @@ CRITICAL RULES:
           : [];
 
       const systemInstruction = `You are LUMINA MUSIC's MV Theater synchronization & film-editing director.
-Your task is to pinpoint:
-1. **前瞻播放段 (Intro)**: A pre-song cinematic/dialogue/title sequence at the beginning of the MV video BEFORE the main song audio starts (` +
-        "`0s -> introEndSec`" +
-        `). During intro, MV original video sound plays without album UI. At ` +
-        "`introEndSec`" +
-        `, the song audio starts at ` +
-        "`0:00.0`" +
-        `.
-2. **后段尾声 (Outro)**: A post-song epilogue/credits/dialogue scene AFTER the main song audio finishes (` +
-        "`outroStartSec -> outroEndSec`" +
-        `). Typically ` +
-        "`outroStartSec`" +
-        ` aligns near where the song audio ends inside the MV, and ` +
-        "`outroEndSec`" +
-        ` is where credits/epilogue finish (up to ` +
-        "`mvDurationSec`" +
-        `).
+Your task is to pinpoint ALL THREE phases comparing the ENTIRE song against the ENTIRE MV video:
+1. **前瞻播放段 (Intro)**: Pre-song cinematic/dialogue sequence at MV start BEFORE song audio 0:00 begins (0s -> introEndSec).
+2. **中间无音频段 (Mid-Breaks)**: Middle cinematic interludes / dialogue pauses inside the MV where song audio pauses at audioTriggerSec, MV plays clear video with original MV sound from mvStartSec -> mvEndSec, then song audio resumes seamlessly at audioTriggerSec aligned with MV mvEndSec. Keep mvEndSec - mvStartSec >= 1.8. Return [] if none.
+3. **后段尾声 (Outro)**: Post-song epilogue/credits scene AFTER the main song audio finishes (outroStartSec -> outroEndSec, up to mvDurationSec).
 
 HOW TO REASON FROM EVIDENCE:
-- You are given REAL acoustic correlation peaks (` +
-        "`headCorrelationCandidates`" +
-        ` comparing song start vs MV waveform; ` +
-        "`tailCorrelationCandidates`" +
-        ` comparing song ending vs MV waveform), ` +
-        "`mvSilenceSegments`" +
-        `, 1-second/step amplitude curves (` +
-        "`mvEnergyTimeline`" +
-        ` & ` +
-        "`songEnergyTimeline`" +
-        `), LRC vocal cue bounds, and (when supported) labeled JPEG keyframes from the MV.
-- If ` +
-        "`mvDurationSec <= songDurationSec + 1.5`" +
-        ` AND no obvious opening title/silence scene exists, do NOT invent a long intro or outro (` +
-        "`recommended: false`" +
-        `).
-- Strictly clamp timestamps within ` +
-        `[0, ${safeMvDur.toFixed(2)}]` +
-        ` seconds, and ensure ` +
-        "`outroEndSec >= outroStartSec`" +
-        `.
-- Never fabricate details you cannot verify from the provided numbers or video frames. Write all explanations in clear, concise Simplified Chinese so the user can visually verify video frames and listen to the audio before confirming.
+- You are given full-track DSP multi-band alignment results (localDraft and alignmentPlateaus mapping songStartSec..songEndSec to mvStartSec..mvEndSec with lagSec and meanCorrelation), mvSilenceSegments, energy timelines, LRC bounds, and labeled JPEG keyframes.
+- Respect strong local acoustic plateau alignments (meanCorrelation >= 0.35). Do NOT invent fake mid-breaks or long intros if plateaus show uninterrupted alignment.
+- Clamp MV timestamps within [0, ${safeMvDur.toFixed(2)}] seconds, and song audioTriggerSec within [0, ${safeSongDur.toFixed(2)}] seconds.
+- Write all explanations in clear, concise Simplified Chinese.
 
 Return strictly valid JSON matching:
 {
@@ -987,6 +970,18 @@ Return strictly valid JSON matching:
     "reason": string,
     "evidenceTimestamps": number[]
   },
+  "midBreaks": [
+    {
+      "id": string,
+      "label": string,
+      "audioTriggerSec": number,
+      "mvStartSec": number,
+      "mvEndSec": number,
+      "confidence": "high" | "medium" | "low",
+      "reason": string,
+      "evidenceTimestamps": number[]
+    }
+  ],
   "outro": {
     "recommended": boolean,
     "outroStartSec": number,
@@ -1006,6 +1001,8 @@ Return strictly valid JSON matching:
         extraDurationSec: Number((safeMvDur - safeSongDur).toFixed(2)),
         firstLyricSec,
         lastLyricSec,
+        localDraft,
+        alignmentPlateaus,
         headCorrelationCandidates,
         tailCorrelationCandidates,
         mvSilenceSegments,
@@ -1063,13 +1060,6 @@ Return strictly valid JSON matching:
             },
           },
         });
-        const builtinModel =
-          typeof model === 'string' && model.trim().startsWith('gemini-')
-            ? model.trim()
-            : 'gemini-4-hydrogen';
-        providerName = '内置 Gemini 多模态引擎';
-        modelUsed = builtinModel;
-        usedVisualFrames = sanitizeFrames.length > 0;
 
         const parts: Array<
           { text: string } | { inlineData: { mimeType: string; data: string } }
@@ -1082,69 +1072,208 @@ Return strictly valid JSON matching:
         }
         parts.push({ text: promptPayload });
 
-        const response = await ai.models.generateContent({
-          model: builtinModel,
-          contents: { parts },
-          config: {
-            systemInstruction,
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-            responseMimeType: 'application/json',
-            responseSchema: {
+        const mvResponseSchema = {
+          type: Type.OBJECT,
+          properties: {
+            summary: { type: Type.STRING },
+            intro: {
               type: Type.OBJECT,
               properties: {
-                summary: { type: Type.STRING },
-                intro: {
-                  type: Type.OBJECT,
-                  properties: {
-                    recommended: { type: Type.BOOLEAN },
-                    introEndSec: { type: Type.NUMBER },
-                    confidence: { type: Type.STRING },
-                    reason: { type: Type.STRING },
-                    evidenceTimestamps: {
-                      type: Type.ARRAY,
-                      items: { type: Type.NUMBER },
-                    },
-                  },
-                  required: [
-                    'recommended',
-                    'introEndSec',
-                    'confidence',
-                    'reason',
-                    'evidenceTimestamps',
-                  ],
-                },
-                outro: {
-                  type: Type.OBJECT,
-                  properties: {
-                    recommended: { type: Type.BOOLEAN },
-                    outroStartSec: { type: Type.NUMBER },
-                    outroEndSec: { type: Type.NUMBER },
-                    confidence: { type: Type.STRING },
-                    reason: { type: Type.STRING },
-                    evidenceTimestamps: {
-                      type: Type.ARRAY,
-                      items: { type: Type.NUMBER },
-                    },
-                  },
-                  required: [
-                    'recommended',
-                    'outroStartSec',
-                    'outroEndSec',
-                    'confidence',
-                    'reason',
-                    'evidenceTimestamps',
-                  ],
+                recommended: { type: Type.BOOLEAN },
+                introEndSec: { type: Type.NUMBER },
+                confidence: { type: Type.STRING },
+                reason: { type: Type.STRING },
+                evidenceTimestamps: {
+                  type: Type.ARRAY,
+                  items: { type: Type.NUMBER },
                 },
               },
-              required: ['summary', 'intro', 'outro'],
+              required: [
+                'recommended',
+                'introEndSec',
+                'confidence',
+                'reason',
+                'evidenceTimestamps',
+              ],
+            },
+            midBreaks: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  id: { type: Type.STRING },
+                  label: { type: Type.STRING },
+                  audioTriggerSec: { type: Type.NUMBER },
+                  mvStartSec: { type: Type.NUMBER },
+                  mvEndSec: { type: Type.NUMBER },
+                  confidence: { type: Type.STRING },
+                  reason: { type: Type.STRING },
+                  evidenceTimestamps: {
+                    type: Type.ARRAY,
+                    items: { type: Type.NUMBER },
+                  },
+                },
+                required: [
+                  'id',
+                  'label',
+                  'audioTriggerSec',
+                  'mvStartSec',
+                  'mvEndSec',
+                  'confidence',
+                  'reason',
+                  'evidenceTimestamps',
+                ],
+              },
+            },
+            outro: {
+              type: Type.OBJECT,
+              properties: {
+                recommended: { type: Type.BOOLEAN },
+                outroStartSec: { type: Type.NUMBER },
+                outroEndSec: { type: Type.NUMBER },
+                confidence: { type: Type.STRING },
+                reason: { type: Type.STRING },
+                evidenceTimestamps: {
+                  type: Type.ARRAY,
+                  items: { type: Type.NUMBER },
+                },
+              },
+              required: [
+                'recommended',
+                'outroStartSec',
+                'outroEndSec',
+                'confidence',
+                'reason',
+                'evidenceTimestamps',
+              ],
             },
           },
-        });
-        rawText = (response.text ?? '').trim();
+          required: ['summary', 'intro', 'midBreaks', 'outro'],
+        };
+
+        const callSingleBuiltinGemini = async (
+          baseModel: 'gemini-3.1-flash-lite' | 'gemini-4-hydrogen',
+          thinkingLevel: ThinkingLevel
+        ): Promise<string> => {
+          const response = await ai.models.generateContent({
+            model: baseModel,
+            contents: { parts },
+            config: {
+              systemInstruction,
+              thinkingConfig: { thinkingLevel },
+              responseMimeType: 'application/json',
+              responseSchema: mvResponseSchema,
+            },
+          });
+          return (response.text ?? '').trim();
+        };
+
+        const requestedSpec = typeof model === 'string' ? model.trim() : '';
+        usedVisualFrames = sanitizeFrames.length > 0;
+
+        if (requestedSpec === '__builtin_auto_ensemble__') {
+          const settled = await Promise.allSettled([
+            callSingleBuiltinGemini('gemini-3.1-flash-lite', ThinkingLevel.MINIMAL),
+            callSingleBuiltinGemini('gemini-4-hydrogen', ThinkingLevel.MEDIUM),
+          ]);
+          const liteRes =
+            settled[0].status === 'fulfilled' && settled[0].value
+              ? { model: 'gemini-3.1-flash-lite', text: settled[0].value }
+              : null;
+          const hydroRes =
+            settled[1].status === 'fulfilled' && settled[1].value
+              ? { model: 'gemini-4-hydrogen', text: settled[1].value }
+              : null;
+
+          if (hydroRes && liteRes) {
+            providerName = '内置谷歌 AI 双模型联合引擎';
+            modelUsed = 'gemini-4-hydrogen + gemini-3.1-flash-lite';
+            let chosenText = hydroRes.text;
+            try {
+              const parseCandidate = (txt: string) =>
+                extractJsonFromLlmText<{
+                  intro?: { introEndSec?: number };
+                  midBreaks?: unknown[];
+                  outro?: { outroStartSec?: number };
+                }>(txt);
+              const hydroJson = parseCandidate(hydroRes.text);
+              const liteJson = parseCandidate(liteRes.text);
+              const refIntro = Number(localDraft?.intro?.introEndSec ?? 0);
+              const refOutro = Number(localDraft?.outro?.outroStartSec ?? safeMvDur);
+              const refMidLen = Array.isArray(localDraft?.midBreaks)
+                ? localDraft.midBreaks.length
+                : 0;
+              const driftScore = (c: ReturnType<typeof parseCandidate>) =>
+                Math.abs(Number(c.intro?.introEndSec ?? 0) - refIntro) +
+                Math.abs(Number(c.outro?.outroStartSec ?? safeMvDur) - refOutro) +
+                Math.abs((Array.isArray(c.midBreaks) ? c.midBreaks.length : 0) - refMidLen) *
+                  12;
+              if (driftScore(liteJson) + 1.5 < driftScore(hydroJson)) {
+                chosenText = liteRes.text;
+              }
+            } catch {
+              try {
+                extractJsonFromLlmText(hydroRes.text);
+                chosenText = hydroRes.text;
+              } catch {
+                chosenText = liteRes.text;
+              }
+            }
+            rawText = chosenText;
+          } else if (liteRes) {
+            providerName = '内置谷歌 AI（Flash Lite 自动接管）';
+            modelUsed = 'gemini-3.1-flash-lite';
+            rawText = liteRes.text;
+          } else if (hydroRes) {
+            providerName = '内置谷歌 AI（Hydrogen 自动接管）';
+            modelUsed = 'gemini-4-hydrogen';
+            rawText = hydroRes.text;
+          } else {
+            const err1 =
+              settled[0].status === 'rejected'
+                ? settled[0].reason instanceof Error
+                  ? settled[0].reason.message
+                  : String(settled[0].reason)
+                : '空响应';
+            const err2 =
+              settled[1].status === 'rejected'
+                ? settled[1].reason instanceof Error
+                  ? settled[1].reason.message
+                  : String(settled[1].reason)
+                : '空响应';
+            throw new Error(`双内置谷歌模型均暂不可用：${err1} / ${err2}`);
+          }
+        } else {
+          const [rawBase, rawTier] = requestedSpec.split('::');
+          const baseModel: 'gemini-3.1-flash-lite' | 'gemini-4-hydrogen' =
+            rawBase === 'gemini-3.1-flash-lite'
+              ? 'gemini-3.1-flash-lite'
+              : 'gemini-4-hydrogen';
+
+          let thinkingLevel: ThinkingLevel =
+            baseModel === 'gemini-3.1-flash-lite'
+              ? ThinkingLevel.MINIMAL
+              : ThinkingLevel.LOW;
+          if (rawTier === 'minimal' && baseModel === 'gemini-3.1-flash-lite') {
+            thinkingLevel = ThinkingLevel.MINIMAL;
+          } else if (rawTier === 'low') {
+            thinkingLevel = ThinkingLevel.LOW;
+          } else if (rawTier === 'medium') {
+            thinkingLevel = ThinkingLevel.MEDIUM;
+          } else if (rawTier === 'high') {
+            thinkingLevel = ThinkingLevel.HIGH;
+          } else if (rawTier === 'xhigh' && baseModel === 'gemini-4-hydrogen') {
+            thinkingLevel = ThinkingLevel.XHIGH;
+          }
+
+          providerName = '内置 Gemini 多模态引擎';
+          modelUsed = rawTier ? `${baseModel} (${rawTier.toUpperCase()})` : baseModel;
+          rawText = await callSingleBuiltinGemini(baseModel, thinkingLevel);
+        }
       } else {
         res.status(400).json({
           error:
-            '尚未配置可用的 AI 服务商。请前往「AI 智能中心 → API 服务管理」添加并启用您的 API 服务商（支持 Gemini / DeepSeek / OpenAI 等）。',
+            '尚未配置可用的 AI 服务商。建议切换为「本地全曲声纹对比引擎」（免 API 密钥），或前往「AI 智能中心 → API 服务管理」配置 DeepSeek / Gemini。',
         });
         return;
       }
@@ -1158,6 +1287,16 @@ Return strictly valid JSON matching:
           reason?: string;
           evidenceTimestamps?: number[];
         };
+        midBreaks?: {
+          id?: string;
+          label?: string;
+          audioTriggerSec?: number;
+          mvStartSec?: number;
+          mvEndSec?: number;
+          confidence?: string;
+          reason?: string;
+          evidenceTimestamps?: number[];
+        }[];
         outro?: {
           recommended?: boolean;
           outroStartSec?: number;
@@ -1172,6 +1311,12 @@ Return strictly valid JSON matching:
         const n = Number(v);
         if (!Number.isFinite(n)) return fallback;
         return Number(Math.max(0, Math.min(safeMvDur, n)).toFixed(2));
+      };
+
+      const clampSong = (v: unknown, fallback = 0) => {
+        const n = Number(v);
+        if (!Number.isFinite(n)) return fallback;
+        return Number(Math.max(0, Math.min(safeSongDur || safeMvDur, n)).toFixed(2));
       };
 
       const introEndSec = clampMv(parsed.intro?.introEndSec, 0);
@@ -1193,20 +1338,56 @@ Return strictly valid JSON matching:
               .map((x) => Number(x.toFixed(1)))
           : [];
 
+      const rawMidSource = Array.isArray(parsed.midBreaks)
+        ? parsed.midBreaks
+        : Array.isArray(localDraft?.midBreaks)
+        ? localDraft.midBreaks
+        : [];
+
+      const midBreaks = rawMidSource
+        .map((b: Record<string, unknown>, idx: number) => {
+          const mvStartSec = clampMv(b?.mvStartSec, 0);
+          const mvEndSec = clampMv(b?.mvEndSec, mvStartSec);
+          const audioTriggerSec = clampSong(b?.audioTriggerSec, 0);
+          return {
+            id:
+              typeof b?.id === 'string' && b.id.trim()
+                ? b.id.trim()
+                : `ai-mid-${idx + 1}`,
+            label:
+              typeof b?.label === 'string' && b.label.trim()
+                ? b.label.trim()
+                : `中段剧情 ${idx + 1}`,
+            audioTriggerSec,
+            mvStartSec,
+            mvEndSec,
+            confidence: normConf(b?.confidence),
+            reason:
+              typeof b?.reason === 'string' && b.reason.trim()
+                ? b.reason.trim()
+                : '全曲时间轴对齐跃迁检测到的中段插曲/剧情区。',
+            evidenceTimestamps: normTimes(b?.evidenceTimestamps),
+          };
+        })
+        .filter((b: { mvEndSec: number; mvStartSec: number }) => b.mvEndSec - b.mvStartSec >= 1.5);
+
       res.json({
         providerName,
         modelUsed,
         usedVisualFrames,
-        summary: parsed.summary || '已完成 MV 与音乐时间轴联合识别，请对照下方视频画面与音频波形确认。',
+        summary:
+          parsed.summary ||
+          '已完成整首歌与整部 MV 的全曲声纹联合识别，请对照画面帧与音频波形确认前瞻、中段与后段参数。',
         intro: {
           recommended: Boolean(parsed.intro?.recommended && introEndSec > 0.3),
           introEndSec,
           confidence: normConf(parsed.intro?.confidence),
           reason:
             parsed.intro?.reason ||
-            '已结合 MV 前半段静默/剧情区与音乐开头声波相关性进行测算。',
+            '已结合全曲前段声纹对齐偏移与 MV 开场特征完成研判。',
           evidenceTimestamps: normTimes(parsed.intro?.evidenceTimestamps),
         },
+        midBreaks,
         outro: {
           recommended: Boolean(
             parsed.outro?.recommended && outroEndSec > outroStartSec + 0.4
@@ -1216,7 +1397,7 @@ Return strictly valid JSON matching:
           confidence: normConf(parsed.outro?.confidence),
           reason:
             parsed.outro?.reason ||
-            '已结合音乐尾声声波衰减位置与 MV 剩余片尾区间进行测算。',
+            '已结合全曲末段对齐位置与 MV 剩余片尾区间完成研判。',
           evidenceTimestamps: normTimes(parsed.outro?.evidenceTimestamps),
         },
       });

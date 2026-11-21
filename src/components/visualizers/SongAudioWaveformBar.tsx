@@ -21,6 +21,7 @@ interface SongAudioWaveformBarProps {
   palette: TrackColorPalette;
   guideTime: number;
   mvPreviewTime: number;
+  aiSuggestedMidBreakTriggers?: number[];
   onSeekAudio: (timeSec: number) => void;
   onGuideChange: (timeSec: number) => void;
   onPlayFromGuide: (timeSec: number) => void;
@@ -38,6 +39,7 @@ export const SongAudioWaveformBar: React.FC<SongAudioWaveformBarProps> = ({
   palette,
   guideTime,
   mvPreviewTime,
+  aiSuggestedMidBreakTriggers = [],
   onSeekAudio,
   onGuideChange,
   onPlayFromGuide,
@@ -128,6 +130,24 @@ export const SongAudioWaveformBar: React.FC<SongAudioWaveformBarProps> = ({
         }
       }
 
+      // 1b. AI-suggested mid-break triggers (dashed purple)
+      if (aiSuggestedMidBreakTriggers.length > 0) {
+        ctx.save();
+        ctx.strokeStyle = '#c084fc';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([3, 3]);
+        for (const trig of aiSuggestedMidBreakTriggers) {
+          if (trig >= 0 && trig <= safeDur) {
+            const tx = timeToX(trig);
+            ctx.beginPath();
+            ctx.moveTo(tx, 0);
+            ctx.lineTo(tx, height);
+            ctx.stroke();
+          }
+        }
+        ctx.restore();
+      }
+
       // Center axis
       const midY = height / 2;
       ctx.strokeStyle = 'rgba(255, 255, 255, 0.08)';
@@ -200,6 +220,7 @@ export const SongAudioWaveformBar: React.FC<SongAudioWaveformBarProps> = ({
     clampedGuide,
     timeline,
     palette,
+    aiSuggestedMidBreakTriggers,
   ]);
 
   const clientXToTime = (clientX: number): number => {

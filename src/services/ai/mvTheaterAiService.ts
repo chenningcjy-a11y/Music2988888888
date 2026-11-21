@@ -1,13 +1,28 @@
 import { TrackMetadata, TrackMvMeta } from '../../types/music';
 import { parseLrc } from '../../utils/lrcParser';
 import {
-  extractMvAudioWaveform,
-  extractTrackAudioWaveform,
-} from '../../utils/mvAudioWaveform';
+  LOCAL_ENGINE_PRESETS,
+  LocalEnginePreset,
+  LocalEnsembleAnalysisResult,
+  LocalFullTrackAnalysisResult,
+  runLocalAllPresetsConsensus,
+  runLocalFullTrackAnalysis,
+} from './localAcousticAnalyzer';
 
 export interface MvTheaterAiIntroSuggestion {
   recommended: boolean;
   introEndSec: number;
+  confidence: 'high' | 'medium' | 'low';
+  reason: string;
+  evidenceTimestamps: number[];
+}
+
+export interface MvTheaterAiMidBreakSuggestion {
+  id: string;
+  label: string;
+  audioTriggerSec: number;
+  mvStartSec: number;
+  mvEndSec: number;
   confidence: 'high' | 'medium' | 'low';
   reason: string;
   evidenceTimestamps: number[];
@@ -22,121 +37,61 @@ export interface MvTheaterAiOutroSuggestion {
   evidenceTimestamps: number[];
 }
 
+export interface MvTheaterAiAnalysisStats {
+  fullTrackCoveragePct: number;
+  meanCorrelation: number;
+  peakCorrelation: number;
+  plateauCount: number;
+  recommendedFadeSec: number;
+  mvHasAudio: boolean;
+  songHasAudio: boolean;
+}
+
+export interface MvTheaterEnsembleCandidateView {
+  preset: LocalEnginePreset;
+  name: string;
+  modelCode: string;
+  introAgreeCount: number;
+  midAgreeCount: number;
+  outroAgreeCount: number;
+  exactAllMatchCount: number;
+  isWinner: boolean;
+  inWinningGroup: boolean;
+  fullResult: MvTheaterAiAnalysisResult;
+}
+
+export interface MvTheaterEnsembleSummary {
+  winningPreset: LocalEnginePreset;
+  winningPresetName: string;
+  introConsensusCount: number;
+  midConsensusCount: number;
+  outroConsensusCount: number;
+  exactGroupCount: number;
+  consensusSummary: string;
+  candidates: MvTheaterEnsembleCandidateView[];
+}
+
 export interface MvTheaterAiAnalysisResult {
   providerName: string;
   modelUsed: string;
   usedVisualFrames: boolean;
+  usedLocalEngine: boolean;
   summary: string;
   intro: MvTheaterAiIntroSuggestion;
+  midBreaks: MvTheaterAiMidBreakSuggestion[];
   outro: MvTheaterAiOutroSuggestion;
+  analysisStats?: MvTheaterAiAnalysisStats;
+  ensembleComparison?: MvTheaterEnsembleSummary;
 }
 
-interface CorrelationCandidate {
-  mvOffsetSec: number;
-  estimatedBoundarySec: number;
-  similarityScore: number;
-}
+export class MvTheaterCloudError extends Error {
+  localDraftResult: MvTheaterAiAnalysisResult;
 
-/**
- * Slides a slice of the song energy envelope over the MV energy envelope to locate
- * acoustic alignment peaks (handles quiet dialogue intros and credit outros).
- */
-function findEnvelopeCorrelationPeaks(
-  mvBins: number[],
-  mvBinDurSec: number,
-  songSegmentBins: number[],
-  maxCandidates = 3
-): { offsetBin: number; score: number }[] {
-  if (mvBins.length === 0 || songSegmentBins.length < 8) return [];
-  if (mvBins.length < songSegmentBins.length) return [];
-
-  const maxOffset = mvBins.length - songSegmentBins.length;
-  const scores: { offsetBin: number; score: number }[] = [];
-
-  let songMean = 0;
-  for (let j = 0; j < songSegmentBins.length; j++) songMean += songSegmentBins[j];
-  songMean /= songSegmentBins.length;
-
-  let songVar = 0;
-  for (let j = 0; j < songSegmentBins.length; j++) {
-    const d = songSegmentBins[j] - songMean;
-    songVar += d * d;
+  constructor(message: string, localDraftResult: MvTheaterAiAnalysisResult) {
+    super(message);
+    this.name = 'MvTheaterCloudError';
+    this.localDraftResult = localDraftResult;
   }
-  if (songVar < 1e-6) return [];
-
-  for (let offset = 0; offset <= maxOffset; offset++) {
-    let mvMean = 0;
-    for (let j = 0; j < songSegmentBins.length; j++) {
-      mvMean += mvBins[offset + j];
-    }
-    mvMean /= songSegmentBins.length;
-
-    let num = 0;
-    let mvVar = 0;
-    for (let j = 0; j < songSegmentBins.length; j++) {
-      const a = mvBins[offset + j] - mvMean;
-      const b = songSegmentBins[j] - songMean;
-      num += a * b;
-      mvVar += a * a;
-    }
-
-    const denom = Math.sqrt(mvVar * songVar);
-    const pearson = denom > 1e-6 ? num / denom : 0;
-    scores.push({ offsetBin: offset, score: Number(pearson.toFixed(3)) });
-  }
-
-  scores.sort((a, b) => b.score - a.score);
-
-  const minSeparationBins = Math.max(4, Math.round(4 / Math.max(0.1, mvBinDurSec)));
-  const picked: { offsetBin: number; score: number }[] = [];
-  for (const cand of scores) {
-    if (
-      picked.every(
-        (existing) => Math.abs(existing.offsetBin - cand.offsetBin) >= minSeparationBins
-      )
-    ) {
-      picked.push(cand);
-      if (picked.length >= maxCandidates) break;
-    }
-  }
-  return picked;
-}
-
-function detectQuietSegments(
-  mvBins: number[],
-  binDurSec: number,
-  threshold = 0.16,
-  minLengthSec = 1.5
-): { startSec: number; endSec: number; avgLevel: number }[] {
-  const out: { startSec: number; endSec: number; avgLevel: number }[] = [];
-  let runStart = -1;
-  let sum = 0;
-  let count = 0;
-
-  for (let i = 0; i <= mvBins.length; i++) {
-    const isQuiet = i < mvBins.length && mvBins[i] <= threshold;
-    if (isQuiet) {
-      if (runStart === -1) {
-        runStart = i;
-        sum = 0;
-        count = 0;
-      }
-      sum += mvBins[i];
-      count++;
-    } else if (runStart !== -1) {
-      const startSec = Number((runStart * binDurSec).toFixed(1));
-      const endSec = Number((i * binDurSec).toFixed(1));
-      if (endSec - startSec >= minLengthSec) {
-        out.push({
-          startSec,
-          endSec,
-          avgLevel: Math.round((sum / Math.max(1, count)) * 100),
-        });
-      }
-      runStart = -1;
-    }
-  }
-  return out.slice(0, 12);
 }
 
 async function captureMvKeyframes(
@@ -148,12 +103,16 @@ async function captureMvKeyframes(
 
   const uniqueTimes = Array.from(
     new Set(
-      timestampsSec
-        .map((t) => Math.max(0.2, Math.min(Math.max(0.2, durationSec - 0.2), Number(t.toFixed(1)))))
+      timestampsSec.map((t) =>
+        Math.max(
+          0.2,
+          Math.min(Math.max(0.2, durationSec - 0.2), Number(t.toFixed(1)))
+        )
+      )
     )
   )
     .sort((a, b) => a - b)
-    .slice(0, 8);
+    .slice(0, 10);
 
   return new Promise((resolve) => {
     const video = document.createElement('video');
@@ -169,7 +128,8 @@ async function captureMvKeyframes(
     canvas.height = 180;
     const ctx = canvas.getContext('2d');
 
-    const captured: { timestampSec: number; mimeType: string; base64Data: string }[] = [];
+    const captured: { timestampSec: number; mimeType: string; base64Data: string }[] =
+      [];
     let settled = false;
 
     const cleanup = () => {
@@ -186,7 +146,7 @@ async function captureMvKeyframes(
       resolve(captured);
     };
 
-    const overallTimer = window.setTimeout(finish, 7000);
+    const overallTimer = window.setTimeout(finish, 7500);
 
     const captureNext = async (idx: number) => {
       if (settled || idx >= uniqueTimes.length || !ctx) {
@@ -245,33 +205,81 @@ async function captureMvKeyframes(
   });
 }
 
-function summarizeTimelineBySecond(
-  bins: number[],
-  totalDurationSec: number,
-  maxPoints = 90
-): { tSec: number; level: number }[] {
-  if (bins.length === 0 || totalDurationSec <= 0) return [];
-  const step = Math.max(1, Math.ceil(bins.length / maxPoints));
-  const out: { tSec: number; level: number }[] = [];
-  for (let i = 0; i < bins.length; i += step) {
-    let sum = 0;
-    let cnt = 0;
-    for (let k = i; k < Math.min(bins.length, i + step); k++) {
-      sum += bins[k];
-      cnt++;
-    }
-    const tSec = Number((((i + cnt / 2) / bins.length) * totalDurationSec).toFixed(1));
-    out.push({
-      tSec,
-      level: Math.round((sum / Math.max(1, cnt)) * 100),
-    });
-  }
-  return out;
+function buildLocalResult(
+  local: LocalFullTrackAnalysisResult,
+  preset: LocalEnginePreset = 'standard'
+): MvTheaterAiAnalysisResult {
+  const cfg = LOCAL_ENGINE_PRESETS[preset] || LOCAL_ENGINE_PRESETS.standard;
+  return {
+    providerName: cfg.name,
+    modelUsed: cfg.modelCode,
+    usedVisualFrames: false,
+    usedLocalEngine: true,
+    summary: local.summary,
+    intro: local.intro,
+    midBreaks: local.midBreaks.map((b) => ({
+      id: b.id,
+      label: b.label,
+      audioTriggerSec: b.audioTriggerSec,
+      mvStartSec: b.mvStartSec,
+      mvEndSec: b.mvEndSec,
+      confidence: b.confidence,
+      reason: b.reason,
+      evidenceTimestamps: b.evidenceTimestamps,
+    })),
+    outro: local.outro,
+    analysisStats: {
+      fullTrackCoveragePct: local.fullTrackCoveragePct,
+      meanCorrelation: local.meanCorrelation,
+      peakCorrelation: local.peakCorrelation,
+      plateauCount: local.plateaus.length,
+      recommendedFadeSec: local.recommendedFadeSec,
+      mvHasAudio: local.mvHasAudio,
+      songHasAudio: local.songHasAudio,
+    },
+  };
+}
+
+function buildEnsembleResult(
+  ensemble: LocalEnsembleAnalysisResult
+): MvTheaterAiAnalysisResult {
+  const winningBase = buildLocalResult(ensemble.winningResult, ensemble.winningPreset);
+  const candidates: MvTheaterEnsembleCandidateView[] = ensemble.candidates.map(
+    (c) => ({
+      preset: c.preset,
+      name: c.name,
+      modelCode: c.modelCode,
+      introAgreeCount: c.introAgreeCount,
+      midAgreeCount: c.midAgreeCount,
+      outroAgreeCount: c.outroAgreeCount,
+      exactAllMatchCount: c.exactAllMatchCount,
+      isWinner: c.isWinner,
+      inWinningGroup: c.inWinningGroup,
+      fullResult: buildLocalResult(c.result, c.preset),
+    })
+  );
+
+  return {
+    ...winningBase,
+    providerName: `4 模型联合共识投票 (主选: ${ensemble.winningPresetName})`,
+    modelUsed: 'DSP-All-4-Consensus',
+    ensembleComparison: {
+      winningPreset: ensemble.winningPreset,
+      winningPresetName: ensemble.winningPresetName,
+      introConsensusCount: ensemble.introConsensusCount,
+      midConsensusCount: ensemble.midConsensusCount,
+      outroConsensusCount: ensemble.outroConsensusCount,
+      exactGroupCount: ensemble.exactGroupCount,
+      consensusSummary: ensemble.consensusSummary,
+      candidates,
+    },
+  };
 }
 
 export async function runMvTheaterAiAnalysis(params: {
   providerId?: string;
   model?: string;
+  localPreset?: LocalEnginePreset | 'all';
   track: TrackMetadata;
   mv: TrackMvMeta;
   mvVideoUrl: string;
@@ -282,6 +290,7 @@ export async function runMvTheaterAiAnalysis(params: {
   const {
     providerId,
     model,
+    localPreset = 'standard',
     track,
     mv,
     mvVideoUrl,
@@ -290,134 +299,110 @@ export async function runMvTheaterAiAnalysis(params: {
     onStageProgress,
   } = params;
 
-  const safeMvDur = Math.max(1, mvDurationSec || mv.durationSec || 1);
-  const safeSongDur = Math.max(1, songDurationSec || track.duration || 1);
-
-  // Extract 0.5-second resolution envelopes (capped cleanly for accuracy)
-  const mvBuckets = Math.min(900, Math.max(60, Math.round(safeMvDur * 2)));
-  const songBuckets = Math.min(900, Math.max(60, Math.round(safeSongDur * 2)));
-
-  onStageProgress?.('1/3 正在解析 MV 与音乐声波包络并计算互相关对齐位置...');
-
-  const [mvWave, songWave] = await Promise.all([
-    extractMvAudioWaveform({
-      mvId: mv.id,
-      sourceType: mv.sourceType,
-      externalUrl: mv.externalUrl,
-      buckets: mvBuckets,
-    }),
-    extractTrackAudioWaveform({
-      trackId: track.id,
-      buckets: songBuckets,
-    }),
-  ]);
-
-  const mvBins = mvWave.peaks;
-  const songBins = songWave.peaks;
-  const actualMvDur = mvWave.durationSec > 0 ? mvWave.durationSec : safeMvDur;
-  const actualSongDur = songWave.durationSec > 0 ? songWave.durationSec : safeSongDur;
-  const mvBinDurSec = mvBins.length > 0 ? actualMvDur / mvBins.length : 0.5;
-  const songBinDurSec = songBins.length > 0 ? actualSongDur / songBins.length : 0.5;
-
-  // Compute acoustic head & tail correlation peaks
-  const headWindowSec = Math.min(48, actualSongDur * 0.45);
-  const headSongCount = Math.min(
-    songBins.length,
-    Math.max(12, Math.round(headWindowSec / Math.max(0.1, songBinDurSec)))
-  );
-  const tailSongCount = Math.min(
-    songBins.length,
-    Math.max(12, Math.round(headWindowSec / Math.max(0.1, songBinDurSec)))
-  );
-
-  // Resample song snippet to MV bin spacing when MV audio waveform is available
-  const resampleSlice = (
-    src: number[],
-    startIdx: number,
-    count: number,
-    srcBinSec: number,
-    dstBinSec: number
-  ): number[] => {
-    const sliceDur = count * srcBinSec;
-    const outLen = Math.max(8, Math.round(sliceDur / Math.max(0.1, dstBinSec)));
-    const out: number[] = [];
-    for (let i = 0; i < outLen; i++) {
-      const ratio = i / outLen;
-      const idx = Math.min(src.length - 1, Math.floor(startIdx + ratio * count));
-      out.push(src[idx] || 0);
+  // When "all" local consensus mode is selected, decode once, run all 4 models, and pick max-agreement group
+  if (localPreset === 'all') {
+    const ensemble = await runLocalAllPresetsConsensus({
+      track,
+      mv,
+      mvDurationSec,
+      songDurationSec,
+      onProgress: onStageProgress,
+    });
+    const consensusResult = buildEnsembleResult(ensemble);
+    if (!providerId || providerId.startsWith('__local_engine__')) {
+      return consensusResult;
     }
-    return out;
-  };
+    // If paired with a cloud provider, pass the winning consensus draft
+    const local = ensemble.winningResult;
+    const localResult = consensusResult;
+    return await runCloudHybridRefinement({
+      providerId,
+      model,
+      track,
+      mv,
+      mvVideoUrl,
+      local,
+      localResult,
+      onStageProgress,
+    });
+  }
 
-  const headCandidatesRaw =
-    mvBins.length > 0 && songBins.length > 0
-      ? findEnvelopeCorrelationPeaks(
-          mvBins,
-          mvBinDurSec,
-          resampleSlice(songBins, 0, headSongCount, songBinDurSec, mvBinDurSec),
-          3
-        )
-      : [];
+  // Always run full-song vs full-MV multi-band acoustic comparison locally first!
+  const local = await runLocalFullTrackAnalysis({
+    track,
+    mv,
+    mvDurationSec,
+    songDurationSec,
+    preset: localPreset,
+    onProgress: onStageProgress,
+  });
 
-  const tailStartIdx = Math.max(0, songBins.length - tailSongCount);
-  const tailSlice =
-    songBins.length > 0
-      ? resampleSlice(songBins, tailStartIdx, tailSongCount, songBinDurSec, mvBinDurSec)
-      : [];
-  const tailCandidatesRaw =
-    mvBins.length > 0 && tailSlice.length > 0
-      ? findEnvelopeCorrelationPeaks(mvBins, mvBinDurSec, tailSlice, 3)
-      : [];
+  const localResult = buildLocalResult(local, localPreset);
 
-  const headCorrelationCandidates: CorrelationCandidate[] = headCandidatesRaw.map(
-    (c) => ({
-      mvOffsetSec: Number((c.offsetBin * mvBinDurSec).toFixed(1)),
-      estimatedBoundarySec: Number((c.offsetBin * mvBinDurSec).toFixed(1)),
-      similarityScore: c.score,
-    })
-  );
+  // Pure local full-track AI mode: return zero-latency local analysis directly
+  if (!providerId || providerId.startsWith('__local_engine__')) {
+    return localResult;
+  }
 
-  const tailCorrelationCandidates: CorrelationCandidate[] = tailCandidatesRaw.map(
-    (c) => {
-      const tailStartSec = c.offsetBin * mvBinDurSec;
-      const tailEndSec = Math.min(
-        actualMvDur,
-        tailStartSec + tailSlice.length * mvBinDurSec
-      );
-      return {
-        mvOffsetSec: Number(tailStartSec.toFixed(1)),
-        estimatedBoundarySec: Number(tailEndSec.toFixed(1)),
-        similarityScore: c.score,
-      };
-    }
-  );
+  return await runCloudHybridRefinement({
+    providerId,
+    model,
+    track,
+    mv,
+    mvVideoUrl,
+    local,
+    localResult,
+    onStageProgress,
+  });
+}
 
-  const mvSilenceSegments =
-    mvBins.length > 0 ? detectQuietSegments(mvBins, mvBinDurSec) : [];
+async function runCloudHybridRefinement(params: {
+  providerId: string;
+  model?: string;
+  track: TrackMetadata;
+  mv: TrackMvMeta;
+  mvVideoUrl: string;
+  local: LocalFullTrackAnalysisResult;
+  localResult: MvTheaterAiAnalysisResult;
+  onStageProgress?: (stageLabel: string) => void;
+}): Promise<MvTheaterAiAnalysisResult> {
+  const {
+    providerId,
+    model,
+    track,
+    mv,
+    mvVideoUrl,
+    local,
+    localResult,
+    onStageProgress,
+  } = params;
 
-  // Sample strategic video keyframes around candidates & opening/ending regions
-  onStageProgress?.('2/3 正在提取 MV 关键画面帧用于视听联合确认...');
-  const extraDur = Math.max(0, actualMvDur - actualSongDur);
-  const topIntroCand =
-    headCorrelationCandidates[0]?.estimatedBoundarySec ??
-    Math.min(extraDur * 0.6, actualMvDur * 0.15);
-  const topOutroStartCand =
-    tailCorrelationCandidates[0]?.estimatedBoundarySec ??
-    Math.min(actualMvDur, topIntroCand + actualSongDur);
-
-  const sampleTimestamps = [
+  // Cloud + Local hybrid mode: capture strategic keyframes across Intro, Mid-Breaks & Outro
+  onStageProgress?.('4/5 正在截取前瞻、中段与片尾临界点画面帧...');
+  const sampleTimestamps: number[] = [
     1.5,
-    Math.max(2, topIntroCand - 2.5),
-    topIntroCand,
-    Math.min(actualMvDur - 1, topIntroCand + 2.5),
-    Math.max(1, topOutroStartCand - 2.5),
-    topOutroStartCand,
-    Math.min(actualMvDur - 0.5, topOutroStartCand + 2.5),
-    Math.max(1, actualMvDur - 3),
+    Math.max(1, local.intro.introEndSec - 2.0),
+    local.intro.introEndSec,
+    Math.min(local.mvDurationSec - 0.5, local.intro.introEndSec + 2.0),
   ];
-  const frames = await captureMvKeyframes(mvVideoUrl, sampleTimestamps, actualMvDur);
 
-  // Extract LRC vocal boundaries if present
+  for (const brk of local.midBreaks.slice(0, 2)) {
+    sampleTimestamps.push(brk.mvStartSec);
+    sampleTimestamps.push(brk.mvEndSec);
+  }
+
+  sampleTimestamps.push(
+    Math.max(1, local.outro.outroStartSec - 2.0),
+    local.outro.outroStartSec,
+    Math.max(1, local.mvDurationSec - 2.5)
+  );
+
+  const frames = await captureMvKeyframes(
+    mvVideoUrl,
+    sampleTimestamps,
+    local.mvDurationSec
+  );
+
   const parsedLrcLines = track.lyricsRaw ? parseLrc(track.lyricsRaw).lines : [];
   const firstLyricSec =
     parsedLrcLines.length > 0 ? Number(parsedLrcLines[0].time.toFixed(1)) : null;
@@ -426,34 +411,80 @@ export async function runMvTheaterAiAnalysis(params: {
       ? Number(parsedLrcLines[parsedLrcLines.length - 1].time.toFixed(1))
       : null;
 
-  onStageProgress?.('3/3 AI 正在综合视频画面与声波相关性研判前瞻与后段位置...');
+  onStageProgress?.('5/5 正在融合本地全曲声纹结论与云端 AI 联合校验前瞻/中段/后段...');
 
-  const res = await fetch('/api/ai/tasks/mv-theater-analyze', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      providerId,
-      model,
-      mvDurationSec: Number(actualMvDur.toFixed(2)),
-      songDurationSec: Number(actualSongDur.toFixed(2)),
-      trackTitle: track.title,
-      artistName: track.artist,
-      mvTitle: mv.title,
-      firstLyricSec,
-      lastLyricSec,
-      headCorrelationCandidates,
-      tailCorrelationCandidates,
-      mvSilenceSegments,
-      mvEnergyTimeline: summarizeTimelineBySecond(mvBins, actualMvDur, 90),
-      songEnergyTimeline: summarizeTimelineBySecond(songBins, actualSongDur, 90),
-      frames,
-    }),
-  });
+  try {
+    const res = await fetch('/api/ai/tasks/mv-theater-analyze', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        providerId,
+        model,
+        mvDurationSec: local.mvDurationSec,
+        songDurationSec: local.songDurationSec,
+        trackTitle: track.title,
+        artistName: track.artist,
+        mvTitle: mv.title,
+        firstLyricSec,
+        lastLyricSec,
+        headCorrelationCandidates: local.plateaus.slice(0, 2).map((p) => ({
+          mvOffsetSec: p.lagSec,
+          estimatedBoundarySec: Number(Math.max(0, p.lagSec).toFixed(1)),
+          similarityScore: p.meanCorrelation,
+        })),
+        tailCorrelationCandidates: local.plateaus.slice(-2).map((p) => ({
+          mvOffsetSec: p.mvStartSec,
+          estimatedBoundarySec: Number(
+            Math.min(local.mvDurationSec, local.songDurationSec + p.lagSec).toFixed(1)
+          ),
+          similarityScore: p.meanCorrelation,
+        })),
+        alignmentPlateaus: local.plateaus,
+        localDraft: {
+          summary: local.summary,
+          fullTrackCoveragePct: local.fullTrackCoveragePct,
+          meanCorrelation: local.meanCorrelation,
+          intro: local.intro,
+          midBreaks: local.midBreaks,
+          outro: local.outro,
+        },
+        mvSilenceSegments: local.mvSilenceSegments,
+        mvEnergyTimeline: local.mvEnergyTimeline,
+        songEnergyTimeline: local.songEnergyTimeline,
+        frames,
+      }),
+    });
 
-  const json = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    throw new Error(json?.error || `AI 分析剧场分段失败 (${res.status})`);
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new MvTheaterCloudError(
+        json?.error || `云端 AI 分析失败 (${res.status})`,
+        localResult
+      );
+    }
+
+    const cloudMidBreaks: MvTheaterAiMidBreakSuggestion[] = Array.isArray(
+      json.midBreaks
+    )
+      ? json.midBreaks
+      : localResult.midBreaks;
+
+    return {
+      providerName: json.providerName || '云端 + 本地联合引擎',
+      modelUsed: json.modelUsed || model || 'auto',
+      usedVisualFrames: Boolean(json.usedVisualFrames),
+      usedLocalEngine: true,
+      summary: json.summary || local.summary,
+      intro: json.intro || local.intro,
+      midBreaks: cloudMidBreaks,
+      outro: json.outro || local.outro,
+      analysisStats: localResult.analysisStats,
+    };
+  } catch (err) {
+    if (err instanceof MvTheaterCloudError) throw err;
+    throw new MvTheaterCloudError(
+      err instanceof Error ? err.message : '云端 AI 请求失败',
+      localResult
+    );
   }
-
-  return json as MvTheaterAiAnalysisResult;
 }

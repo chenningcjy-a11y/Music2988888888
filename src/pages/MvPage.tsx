@@ -18,7 +18,10 @@ import { MvAudioWaveformBar } from '../components/visualizers/MvAudioWaveformBar
 import { MvTheaterAiAssistantCard } from '../components/visualizers/MvTheaterAiAssistantCard';
 import { SongAudioWaveformBar } from '../components/visualizers/SongAudioWaveformBar';
 import { useMusic } from '../context/MusicContext';
-import { MvTheaterAiAnalysisResult } from '../services/ai/mvTheaterAiService';
+import {
+  MvTheaterAiAnalysisResult,
+  MvTheaterAiMidBreakSuggestion,
+} from '../services/ai/mvTheaterAiService';
 import { MvMidBreakRange, TrackMvTimelineConfig } from '../types/music';
 import { formatTime } from '../utils/constants';
 import { createDefaultMvTimeline } from '../utils/mvTimeline';
@@ -309,6 +312,24 @@ export const MvPage: React.FC = () => {
     );
   };
 
+  const handleApplyAiMidBreaks = async (
+    midBreaks: MvTheaterAiMidBreakSuggestion[]
+  ) => {
+    const mapped: MvMidBreakRange[] = midBreaks.map((b, idx) => ({
+      id: b.id || `ai-mid-${Date.now()}-${idx}`,
+      label: b.label || `中段剧情 ${idx + 1}`,
+      audioTriggerSec: Number(b.audioTriggerSec.toFixed(2)),
+      mvStartSec: Number(b.mvStartSec.toFixed(2)),
+      mvEndSec: Number(b.mvEndSec.toFixed(2)),
+    }));
+    await patchTimeline({ midBreaks: mapped });
+    showToast(
+      mapped.length > 0
+        ? `已确认并应用 ${mapped.length} 处中段剧情配置`
+        : '已确认当前 MV 无中间无音频段'
+    );
+  };
+
   const handleApplyAiOutro = async (outroEndSec: number, recommended: boolean) => {
     await patchTimeline({
       outroEnabled: recommended,
@@ -322,17 +343,32 @@ export const MvPage: React.FC = () => {
   };
 
   const handleApplyAllAiSuggestions = async (res: MvTheaterAiAnalysisResult) => {
+    const mappedMidBreaks: MvMidBreakRange[] = (res.midBreaks || []).map(
+      (b, idx) => ({
+        id: b.id || `ai-mid-${Date.now()}-${idx}`,
+        label: b.label || `中段剧情 ${idx + 1}`,
+        audioTriggerSec: Number(b.audioTriggerSec.toFixed(2)),
+        mvStartSec: Number(b.mvStartSec.toFixed(2)),
+        mvEndSec: Number(b.mvEndSec.toFixed(2)),
+      })
+    );
     await patchTimeline({
       introEnabled: res.intro.recommended,
       introEndSec: res.intro.recommended
         ? Number(res.intro.introEndSec.toFixed(2))
         : 0,
+      midBreaks: mappedMidBreaks,
       outroEnabled: res.outro.recommended,
       outroEndSec: res.outro.recommended
         ? Number(res.outro.outroEndSec.toFixed(2))
         : undefined,
+      ...(res.analysisStats?.recommendedFadeSec
+        ? { fadeTransitionSec: res.analysisStats.recommendedFadeSec }
+        : {}),
     });
-    showToast('已确认并应用 AI 推荐的前瞻与后段配置');
+    showToast(
+      `已确认并应用全曲 AI 参数（前瞻${res.intro.recommended ? '开启' : '关闭'} · 中段 ${mappedMidBreaks.length} 处 · 后段${res.outro.recommended ? '开启' : '关闭'}）`
+    );
   };
 
   return (
@@ -555,6 +591,7 @@ export const MvPage: React.FC = () => {
                 onPreviewVideoAt={handlePreviewVideoAt}
                 onAuditionMusicAt={handleAuditionMusicAt}
                 onApplyIntro={handleApplyAiIntro}
+                onApplyMidBreaks={handleApplyAiMidBreaks}
                 onApplyOutro={handleApplyAiOutro}
                 onApplyBoth={handleApplyAllAiSuggestions}
                 onOpenAiCenter={() => setActivePage('ai')}
@@ -651,6 +688,10 @@ export const MvPage: React.FC = () => {
                             introEndSec: aiAnalysis.intro.recommended
                               ? aiAnalysis.intro.introEndSec
                               : undefined,
+                            midBreaks: (aiAnalysis.midBreaks || []).map((b) => ({
+                              mvStartSec: b.mvStartSec,
+                              mvEndSec: b.mvEndSec,
+                            })),
                             outroStartSec: aiAnalysis.outro.recommended
                               ? aiAnalysis.outro.outroStartSec
                               : undefined,
@@ -775,6 +816,9 @@ export const MvPage: React.FC = () => {
                       palette={activePalette}
                       guideTime={musicGuideTime}
                       mvPreviewTime={displayPreviewTime}
+                      aiSuggestedMidBreakTriggers={
+                        aiAnalysis?.midBreaks?.map((b) => b.audioTriggerSec) || []
+                      }
                       onSeekAudio={seekTo}
                       onGuideChange={setMusicGuideTime}
                       onPlayFromGuide={handlePlayMusicFromGuide}

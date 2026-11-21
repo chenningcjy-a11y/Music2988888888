@@ -10,6 +10,7 @@ import {
   Mic2,
   Minimize2,
   Pause,
+  Pencil,
   Play,
   Repeat,
   Repeat1,
@@ -20,6 +21,7 @@ import {
   VolumeX,
   X,
 } from 'lucide-react';
+import { TrackInfoEditModal } from '../components/TrackInfoEditModal';
 import { VocalBackgroundControl } from '../components/audio/VocalBackgroundControl';
 import { FullscreenThreeLineLyrics } from '../components/lyrics/FullscreenThreeLineLyrics';
 import { LyricsEditorModal } from '../components/lyrics/LyricsEditorModal';
@@ -67,6 +69,7 @@ export const PlayerPage: React.FC = () => {
     toggleShuffle,
     cycleRepeat,
     toggleFavorite,
+    updateTrackInfo,
     updateTrackCover,
     updateTrackLyrics,
     translateTrackLyrics,
@@ -90,6 +93,7 @@ export const PlayerPage: React.FC = () => {
 
   const [searchOpen, setSearchOpen] = useState(false);
   const [editorOpen, setEditorOpen] = useState(false);
+  const [trackInfoEditOpen, setTrackInfoEditOpen] = useState(false);
   const [vocalMixerOpen, setVocalMixerOpen] = useState(false);
   const [showExitHint, setShowExitHint] = useState(false);
   const [showMvSkipOnTap, setShowMvSkipOnTap] = useState(false);
@@ -510,6 +514,17 @@ export const PlayerPage: React.FC = () => {
               <h1 className="font-display font-semibold text-white truncate max-w-full text-xl sm:text-2xl lg:text-[26px]">
                 {currentTrack ? currentTrack.title : '暂无播放曲目'}
               </h1>
+              {currentTrack && (
+                <button
+                  type="button"
+                  onClick={() => setTrackInfoEditOpen(true)}
+                  title="修改文件名（歌曲名称与人物）"
+                  aria-label="修改文件名（歌曲名称与人物）"
+                  className="p-1.5 rounded-lg text-white/45 hover:text-white hover:bg-white/10 transition-colors cursor-pointer shrink-0"
+                >
+                  <Pencil className="w-3.5 h-3.5" />
+                </button>
+              )}
             </div>
             <p className="truncate text-sm text-white/70">
               {currentTrack
@@ -610,7 +625,11 @@ export const PlayerPage: React.FC = () => {
               <button
                 type="button"
                 onClick={toggleShuffle}
-                title={shuffle ? '随机播放已开启' : '开启随机播放'}
+                title={
+                  shuffle
+                    ? '不重复随机已开启（整队列播完前不重复）'
+                    : '开启不重复随机播放'
+                }
                 aria-label="随机播放"
                 className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-full transition-colors cursor-pointer hover:bg-white/8"
                 style={{ color: shuffle ? activePalette.primary : 'rgba(255,255,255,0.6)' }}
@@ -1007,6 +1026,14 @@ export const PlayerPage: React.FC = () => {
         onSave={(raw) => {
           if (currentTrack) updateTrackLyrics(currentTrack.id, raw);
         }}
+      />
+
+      <TrackInfoEditModal
+        open={trackInfoEditOpen}
+        track={currentTrack}
+        palette={activePalette}
+        onClose={() => setTrackInfoEditOpen(false)}
+        onSave={updateTrackInfo}
       />
     </div>
   );

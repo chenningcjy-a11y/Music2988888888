@@ -5,6 +5,7 @@ import {
   ImagePlus,
   ListPlus,
   Music2,
+  Pencil,
   Play,
   Plus,
   Search,
@@ -12,6 +13,7 @@ import {
   Trash2,
   Upload,
 } from 'lucide-react';
+import { TrackInfoEditModal } from '../components/TrackInfoEditModal';
 import { useMusic } from '../context/MusicContext';
 import {
   formatBitrate,
@@ -36,6 +38,7 @@ export const LibraryPage: React.FC = () => {
     deleteTrack,
     enqueueTrack,
     addTrackToPlaylist,
+    updateTrackInfo,
     updateTrackCover,
     loadDemoLibrary,
     personalization,
@@ -45,10 +48,16 @@ export const LibraryPage: React.FC = () => {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const coverInputRef = useRef<HTMLInputElement | null>(null);
   const [coverTargetTrackId, setCoverTargetTrackId] = useState<string | null>(null);
+  const [editingTrackId, setEditingTrackId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [filterMode, setFilterMode] = useState<'all' | 'favorites'>('all');
   const [dragOver, setDragOver] = useState(false);
   const [playlistMenuTrackId, setPlaylistMenuTrackId] = useState<string | null>(null);
+
+  const editingTrack = useMemo(
+    () => tracks.find((t) => t.id === editingTrackId) || null,
+    [tracks, editingTrackId]
+  );
 
   const filteredTracks = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
@@ -359,6 +368,16 @@ export const LibraryPage: React.FC = () => {
 
                   <button
                     type="button"
+                    onClick={() => setEditingTrackId(track.id)}
+                    title="修改文件名（歌曲名称与人物）"
+                    aria-label="修改文件名（歌曲名称与人物）"
+                    className="min-w-[38px] min-h-[38px] sm:min-w-[40px] sm:min-h-[40px] flex items-center justify-center rounded-xl text-white/60 hover:text-white hover:bg-white/10 transition-colors cursor-pointer"
+                  >
+                    <Pencil className="w-4 h-4" />
+                  </button>
+
+                  <button
+                    type="button"
                     onClick={() => {
                       setCoverTargetTrackId(track.id);
                       coverInputRef.current?.click();
@@ -446,6 +465,14 @@ export const LibraryPage: React.FC = () => {
           })}
         </div>
       )}
+
+      <TrackInfoEditModal
+        open={Boolean(editingTrack)}
+        track={editingTrack}
+        palette={activePalette}
+        onClose={() => setEditingTrackId(null)}
+        onSave={updateTrackInfo}
+      />
     </div>
   );
 };

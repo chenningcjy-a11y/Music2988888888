@@ -15,6 +15,7 @@ interface MvAudioWaveformBarProps {
   alignMarkerTime?: number | null;
   aiSuggestedMarkers?: {
     introEndSec?: number;
+    midBreaks?: { mvStartSec: number; mvEndSec: number }[];
     outroStartSec?: number;
     outroEndSec?: number;
   } | null;
@@ -192,6 +193,23 @@ export const MvAudioWaveformBar: React.FC<MvAudioWaveformBarProps> = ({
           ctx.moveTo(ax, 0);
           ctx.lineTo(ax, height);
           ctx.stroke();
+        }
+        if (Array.isArray(aiSuggestedMarkers.midBreaks)) {
+          for (const brk of aiSuggestedMarkers.midBreaks) {
+            if (brk.mvEndSec > brk.mvStartSec) {
+              const bsx = timeToX(brk.mvStartSec);
+              const bex = timeToX(brk.mvEndSec);
+              ctx.fillStyle = 'rgba(192, 132, 252, 0.14)';
+              ctx.fillRect(bsx, 0, Math.max(2, bex - bsx), height);
+              ctx.strokeStyle = '#c084fc';
+              ctx.beginPath();
+              ctx.moveTo(bsx, 0);
+              ctx.lineTo(bsx, height);
+              ctx.moveTo(bex, 0);
+              ctx.lineTo(bex, height);
+              ctx.stroke();
+            }
+          }
         }
         if (
           typeof aiSuggestedMarkers.outroStartSec === 'number' &&
